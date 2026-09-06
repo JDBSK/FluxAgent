@@ -1,0 +1,7 @@
+from __future__ import annotations 
+from typing import Any 
+import hashlib 
+ 
+def _sid(text: str) -> str: 
+    return hashlib.md5(text.encode(chr(117)+chr(116)+chr(102)+chr(45)+chr(56))).hexdigest()[:8] 
+ 

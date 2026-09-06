@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "fluxagent": {
+      "command": "fluxagent-mcp",
+      "args": [],
+      "env": {}
+    }
+  },
+  "_comment": "Default rejects side-effect tools. To open them: args [\"--allow-side-effects\"]. Install: pip install -e . then restart client."
+}
