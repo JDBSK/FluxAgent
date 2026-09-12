@@ -51,7 +51,9 @@ def _eval_node(node: Any) -> Any:
         left = _eval_node(node.left)
         right = _eval_node(node.right)
         if isinstance(node.op, ast.Pow):
-            if not isinstance(right, int) or abs(right) > MAX_EXPONENT:
+            # int 指数走精确位宽估算；浮点指数（如 2**0.5）只卡幅值，
+            # 溢出由 _bounded 的 float 范围检查兜底。
+            if not isinstance(right, (int, float)) or abs(right) > MAX_EXPONENT:
                 raise ValueError("exponent too large")
             if isinstance(left, int) and abs(left) > 1:
                 estimated_bits = abs(right) * max(1, abs(left).bit_length())

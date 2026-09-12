@@ -144,7 +144,24 @@ def render_event(line: str):
             
         elif event == "system_action":
             action = data.get("action", "")
-            console.print(f"{prefix}[warning]✦ 底层状态机：{action}[/warning]")
+            if str(action).startswith("subagent_"):
+                # 子任务生命周期：谁在做（角色/来源）、父子任务 ID、终态。
+                # 用 Text 字面渲染，内容不做 markup 解释，避免日志注入样式。
+                duration = data.get("duration_ms")
+                line = Text(
+                    f"{prefix}✦ 子任务[{action}]"
+                    f" 角色={data.get('agent_name', '?')}"
+                    f"({data.get('role_source', '?')})"
+                    f" run={str(data.get('run_id', '-'))[:8]}"
+                    f" parent={str(data.get('parent_run_id', '-'))[:8]}"
+                    + (f" 耗时={duration}ms" if duration is not None else "")
+                    + (f" 工具={data.get('tools')}" if data.get("tools") else "")
+                    + (f"\n  {data.get('content', '')}" if data.get("content") else ""),
+                    style="warning",
+                )
+                console.print(line)
+            else:
+                console.print(f"{prefix}[warning]✦ 底层状态机：{action}[/warning]")
 
         elif event == "graph_transition":
             source = data.get("from_node", "?")

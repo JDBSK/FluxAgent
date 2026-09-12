@@ -54,7 +54,7 @@ class ToolRegistry:
             schema: dict[str, Any] = {"type": "object", "properties": {}}
             try:
                 if tool.args_schema is not None:
-                    raw = tool.args_schema.model_json_schema()
+                    raw = tool.args_schema.model_json_schema()  # 生成 JSON Schema
                     schema = {
                         "type": "object",
                         "properties": raw.get("properties", {}),

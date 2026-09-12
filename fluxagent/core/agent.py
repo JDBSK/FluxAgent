@@ -92,6 +92,9 @@ POLICY_DENY_NOTE = (
     "请不要重试同一非法参数，向用户说明并给出安全替代方案。"
 )
 
+# 一次性执行凭据不允许原样进入审计日志
+_REDACT_HELP_TOKEN_RE = re.compile(r"help_token: [A-Za-z0-9_-]+", re.IGNORECASE)
+
 
 def _needs_plan(text: str) -> bool:
     # 当前使用的是规则分类器，根据文本长度、动作数量、是否涉及多文件、是否需要工具等特征判断，减少简单请求的一次模型调用
@@ -134,10 +137,11 @@ _UNVERIFIED_ACTION_CLAIMS = (
 
 
 def _has_unverified_action_claim(content: Any) -> bool:
-    """Detect success/tool-call claims that have no structured tool result."""
+    """检测到成功/工具调用的声明，但没有结构化工具结果。"""
     if not isinstance(content, str):
         return False
-    return any(claim in content for claim in _UNVERIFIED_ACTION_CLAIMS)
+    
+    return any(claim in content for claim in _UNVERIFIED_ACTION_CLAIMS)  # 
 
 
 def _metadata_aliases(value: Any) -> set[str]:
@@ -362,10 +366,11 @@ def _latest_user_turn(messages: list[Any]) -> list[Any]:
 
 
 def _install_call_from_user_request(messages: list[Any], user_text: str) -> Optional[dict[str, Any]]:
-    """Build a structured install call from an explicit GitHub install request."""
+    """建立一个结构化的安装调用，从明确的 GitHub 安装请求中提取。"""
     text = str(user_text or "")
     if not (("安装" in text or "install" in text.casefold()) and ("github.com/" in text.casefold())):
         return None
+    
     # A short "继续安装" message can refer to the URL in the preceding turn.
     search_text = "\n".join(str(getattr(message, "content", "")) for message in messages[-12:])
     search_text += "\n" + text
@@ -409,14 +414,14 @@ def _parse_plan(raw: str) -> list[dict[str, Any]]:
 
 
 def _build_planner_prompt(goal: str) -> str:
-    """Build the planner prompt shared by runtime code and live evaluation."""
+    """建立规划器提示，由运行时代码和实时评估共享."""
     return (
-        "You are the planner. Split the user goal into 2-6 executable steps.\n"
-        f"Goal: {goal}\n\n"
-        "Rules:\n"
-        "1. Output ONLY a JSON string array\n"
-        "2. One action per step, no numbering, no explanation\n"
-        "3. Do not invent steps the user did not ask for"
+        "你是一个智能规划器，负责将用户的目标拆解成 2-6 个可执行步骤。\n"
+        f"目标: {goal}\n\n"
+        "规则:\n"
+        "1. 只输出一个 JSON 字符串数组\n"
+        "2. 每个步骤一个动作，不编号，不解释\n"
+        "3. 不要创造用户没有要求的步骤"
     )
 
 
@@ -435,6 +440,11 @@ def create_agent_app(
     permission_manager=None,
     context_trigger_turns: int = CONTEXT_TRIGGER_TURNS,
     context_keep_turns: int = CONTEXT_KEEP_TURNS,
+    *,
+    enable_subagents: Optional[bool] = None,
+    subagent_specs: Optional[list] = None,
+    allow_dynamic_subagents: bool = True,
+    dynamic_subagent_tools: Optional[List[BaseTool]] = None,
 ):
     """创建并编译 Agent 状态图应用。
 
@@ -457,6 +467,12 @@ def create_agent_app(
         permission_manager: 可选权限管理器，提供持续授权但不绕过 critical 硬拒绝。
         context_trigger_turns: 上下文裁剪高水位，默认 20 个用户回合。
         context_keep_turns: 裁剪后的低水位，默认保留最近 10 个用户回合。
+        enable_subagents: 是否注册 delegate_task 委派工具；None 表示自动判定
+            （默认工具集时开启；显式传 tools 时保持旧行为，除非显式传 True）。
+        subagent_specs: 自定义预设子 Agent 角色集合；None 用内置两个只读角色。
+        allow_dynamic_subagents: 是否允许主 Agent 临时定义新角色（默认允许）。
+        dynamic_subagent_tools: 动态角色可选工具白名单；None 用默认只读集
+            （列目录 + 读文件），空列表为纯分析。
 
     Returns:
         编译后的 LangGraph 应用，支持 astream/aget_state/aupdate_state。
@@ -471,13 +487,29 @@ def create_agent_app(
         dynamic_tools = load_dynamic_skills()
         actual_tools = BUILTIN_TOOLS + dynamic_tools
     else:
-        actual_tools = tools
+        actual_tools = list(tools)
 
     run_budget = budget or DEFAULT_BUDGET
     policy_cfg = policy or build_policy_config(
         approval_tools=approval_tools,
         hard_deny_critical=hard_deny_critical,
     )
+
+    # 子 Agent 委派：保留显式 tools= 的旧行为；默认 CLI 工具集自动获得委派。
+    # 显式传 enable_subagents=True/False 时以显式值为准。
+    if enable_subagents is None:
+        enable_subagents = tools is None or subagent_specs is not None
+    if enable_subagents:
+        from .subagents import SubagentRunner
+        runner = SubagentRunner(
+            subagent_specs, provider_name=provider_name, model_name=model_name,
+            allow_dynamic=allow_dynamic_subagents,
+            dynamic_tools=dynamic_subagent_tools, policy=policy_cfg)
+        actual_tools = actual_tools + [runner.as_tool()]
+
+    tool_names = [tool.name for tool in actual_tools]
+    if len(tool_names) != len(set(tool_names)):
+        raise ValueError("工具名称冲突：内置工具、技能与委派工具必须使用唯一名称")
 
     tool_node = ToolNode(actual_tools)
 
@@ -606,8 +638,8 @@ def create_agent_app(
             "task_status": TASK_PENDING,
             "retry_count": 0,
             "replan_count": 0,
-            "last_failure_class": "",
-            "last_failure_note": "",
+            "last_failure_class": "",  # 上次失败的分类（tool_failure、policy_block、budget_exceeded、unknown）
+            "last_failure_note": "",  # 上次失败的简要说明
             "llm_calls": 0,
             "tool_rounds": 0,
             "run_started_at": 0.0,
@@ -682,13 +714,15 @@ def create_agent_app(
                 else:
                     break
 
-            # 审计日志：记录最近的工具调用结果
+            # 审计日志：记录最近的工具调用结果（help_token 凭据脱敏）
             for msg in reversed(recent_tool_msgs):
                 audit_logger.log_event(
                     thread_id=thread_id,
                     event="tool_result",
                     tool=msg.name,
-                    result_summary=str(msg.content)[:200],
+                    result_summary=_REDACT_HELP_TOKEN_RE.sub(
+                        "help_token: [REDACTED]", str(msg.content)
+                    )[:200],
                 )
 
         # 对话达到高水位后裁到低水位；旧回合压成摘要并用 RemoveMessage 删除。
@@ -799,6 +833,15 @@ def create_agent_app(
             "8. User profile:\n"
             f"{profile_content}\n"
         )
+        if enable_subagents:
+            sys_prompt += (
+                "\n9. 复杂且可独立处理的阅读、分析任务可以调用 delegate_task 委派子 Agent。"
+                "可使用预设角色；需要其他专长时，按 delegate_task 工具描述临时定义新角色"
+                "（instructions 定义职责与方法，tool_names 只选必要工具，留空为纯分析）。"
+                "只传必要背景与相对路径，不要发送整段历史或任何凭据。"
+                "子 Agent 默认只读，不能修改文件；不要声称子任务完成了修改。"
+                "必须检查返回 status；failed、timeout、step_limit、busy 或 rejected 都不代表完成。\n"
+            )
         if scope_label:
             names = ", ".join(str(tool.name) for tool in scoped_tools)
             sys_prompt += (
@@ -849,18 +892,21 @@ def create_agent_app(
 
         # 把拼好的 prompt + 裁好的 messages 喂给 LLM
         state_updates.update(bump_llm_calls({**state, **state_updates}, 1))
-        # Bind the narrowed set for this turn.  This is a hard capability
+        # 绑定工具列表，调用 LLM 生成回复或工具调用
         # boundary for providers that honor tool schemas, rather than a soft
         # "prefer" instruction competing with unrelated MCP descriptions.
-        response = llm.bind_tools(scoped_tools).invoke(msgs_for_llm)
-        unverified_claim = _has_unverified_action_claim(response.content)
+        # 透传运行 config（thread_id/callbacks/run_id），供追踪与回调使用。
+        response = llm.bind_tools(scoped_tools).invoke(msgs_for_llm, config=config)
+        unverified_claim = _has_unverified_action_claim(response.content)  # 检测 LLM 回复中是否有声称执行了操作但没有结构化 tool_calls 的情况
         if not response.tool_calls:
             recovered = _install_call_from_user_request(
                 raw_messages, str(last_human.content) if last_human else ""
             )
             if recovered:
                 response = AIMessage(content="", tool_calls=[recovered])
+
         if not response.tool_calls and unverified_claim:
+            # 如果 LLM 声称执行了操作但没有结构化 tool_calls，返回一个 AIMessage 提醒用户提供完整安装参数
             response = AIMessage(
                 content=(
                     "未检测到真实的 MCP 工具调用，因此没有启动后台安装。"
@@ -875,7 +921,11 @@ def create_agent_app(
                     thread_id=thread_id,
                     event="tool_call",
                     tool=tool_call["name"],
-                    args=tool_call["args"],
+                    # help_token 是一次性执行凭据，进日志前必须脱敏
+                    args={
+                        key: ("[REDACTED]" if key == "help_token" else value)
+                        for key, value in (tool_call.get("args") or {}).items()
+                    },
                 )
         elif response.content:
             audit_logger.log_event(
@@ -998,8 +1048,8 @@ def create_agent_app(
         updates.update(
             {
                 "current_task": goal[:200],
-                "task_plan": plan,
-                "step_index": 0,
+                "task_plan": plan,  # 计划的步骤列表
+                "step_index": 0, # 当前执行的步骤索引，是串行执行的，0表示第一个步骤
                 "task_status": TASK_RUNNING,
                 "retry_count": 0,
                 "replan_count": 0,
@@ -1180,9 +1230,10 @@ def create_agent_app(
             )
             routed_tools, routed_label = _tool_scope_for_turn(
                 str(last_human.content) if last_human else "", actual_tools
-            )
+            )  # 获取当前用户请求中允许的工具列表和标签
             allowed_names = {str(tool.name) for tool in routed_tools}
             if str(last_tool.name) not in allowed_names:
+                # 记录工具选择不匹配的事件，帮助审计和调试
                 audit_logger.log_event(
                     thread_id=thread_id,
                     event="tool_selection_mismatch",

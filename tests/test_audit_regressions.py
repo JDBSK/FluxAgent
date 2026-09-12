@@ -92,9 +92,15 @@ def test_mcp_index_failure_rolls_back_installed_tree():
         (source / "server.py").write_text("print('ok')\n", encoding="utf-8")
         target = root / "servers"
 
+        # 本用例验证的是"索引写失败 → 已安装目录回滚"的事务性。
+        # 夹具里的 print 桩服务器无法完成 MCP initialize 握手，
+        # 启动健康检查由 tests/test_installer.py 单独覆盖，这里替换为桩探针。
         with patch(
             "fluxagent.core.installer._write_mcp_index",
             side_effect=OSError("disk full"),
+        ), patch(
+            "fluxagent.core.installer._probe_mcp",
+            return_value=["stub_tool"],
         ), pytest.raises(OSError, match="disk full"):
             install_mcp_source(
                 "local",
@@ -128,8 +134,7 @@ def test_safe_calculator_rejects_power_bomb():
 def test_logger_shutdown_is_idempotent():
     """Explicit shutdown followed by atexit shutdown must not block."""
     with tempfile.TemporaryDirectory() as tmp:
-        logger = object.__new__(JSONLEventLogger)
-        logger._init_logger(tmp)
+        logger = JSONLEventLogger(tmp)
         logger.log_event("session", "test", value=1)
         logger.shutdown()
         logger.shutdown()

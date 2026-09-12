@@ -73,6 +73,10 @@ TOOL_BASE_LEVEL: dict[str, RiskLevel] = {
     "read_office_file": RiskLevel.READ,
     "list_scheduled_tasks": RiskLevel.READ,
     "get_system_model_info": RiskLevel.READ,
+    # 委派是编排/分析类动作：子 Agent 默认只读，委派本身不产生副作用。
+    # 子 Agent 作用域内的具体工具调用另由 subagents 的策略闸门单独评估。
+    "delegate_task": RiskLevel.READ,
+    "read_user_profile": RiskLevel.READ,
     "write_office_file": RiskLevel.WRITE,
     "save_user_profile": RiskLevel.MUTATE,
     "schedule_task": RiskLevel.MUTATE,

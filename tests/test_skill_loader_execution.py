@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -37,8 +38,18 @@ def test_unknown_skill_script_is_rejected_with_available_scripts():
         _write_skill(root, "script_skill", {"scripts/main.py": "print('ok')\n"})
         with patch("fluxagent.core.skill_loader.SKILLS_DIR", str(root)):
             tool = LazySkillLoader().get_all_tools(force_rescan=True)[0]
+            cfg = {"configurable": {"thread_id": "tester"}}
+            manual = tool.invoke({"mode": "help"}, config=cfg)
+            token = re.search(r"help_token: ([A-Za-z0-9_-]+)", manual).group(1)
             result = json.loads(
-                tool.invoke({"mode": "run", "command": "python {baseDir}/scripts/missing.py"})
+                tool.invoke(
+                    {
+                        "mode": "run",
+                        "command": "python {baseDir}/scripts/missing.py",
+                        "help_token": token,
+                    },
+                    config=cfg,
+                )
             )
 
     assert result["error"]["code"] == "skill_script_not_found"
@@ -55,14 +66,24 @@ def test_known_skill_script_keeps_base_dir_replacement():
             "fluxagent.core.skill_loader.execute_office_shell", shell
         ):
             tool = LazySkillLoader().get_all_tools(force_rescan=True)[0]
+            cfg = {"configurable": {"thread_id": "tester"}}
+            # 新契约：脚本技能 run 必须先 help 获取本会话一次性 help_token。
+            manual = tool.invoke({"mode": "help"}, config=cfg)
+            token = re.search(r"help_token: ([A-Za-z0-9_-]+)", manual).group(1)
             result = tool.invoke(
-                {"mode": "run", "command": "python {baseDir}/scripts/main.py --question hi"}
+                {
+                    "mode": "run",
+                    "command": "python {baseDir}/scripts/main.py --question hi",
+                    "help_token": token,
+                },
+                config=cfg,
             )
 
     assert result == "ran"
-    shell.invoke.assert_called_once_with(
-        {"command": "python skills/script_skill/scripts/main.py --question hi"}
-    )
+    shell.invoke.assert_called_once()
+    assert shell.invoke.call_args.args[0] == {
+        "command": "python skills/script_skill/scripts/main.py --question hi"
+    }
 
 
 def test_skill_metadata_exposes_declared_trigger_aliases():

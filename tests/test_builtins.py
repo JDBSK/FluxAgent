@@ -85,18 +85,20 @@ class TestBuiltInTools(unittest.TestCase):
 class TestScheduledTasks(unittest.TestCase):
 
     def setUp(self):
-        # 创建临时任务文件
-        self.temp_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json')
+        # 创建临时任务文件。注意：句柄必须立即关闭——任务写入使用
+        # os.replace 原子替换，Windows 不允许替换仍被打开的文件。
+        handle = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json')
+        self.temp_file_name = handle.name
+        handle.close()
         self.original_tasks_file = TASKS_FILE
         # 更新 TASKS_FILE 指向临时文件
         import fluxagent.core.tools.builtins
-        fluxagent.core.tools.builtins.TASKS_FILE = self.temp_file.name
+        fluxagent.core.tools.builtins.TASKS_FILE = self.temp_file_name
 
     def tearDown(self):
         # 清理临时文件
-        self.temp_file.close()
-        if os.path.exists(self.temp_file.name):
-            os.unlink(self.temp_file.name)
+        if os.path.exists(self.temp_file_name):
+            os.unlink(self.temp_file_name)
         # 恢复原始路径
         import fluxagent.core.tools.builtins
         fluxagent.core.tools.builtins.TASKS_FILE = self.original_tasks_file
@@ -118,7 +120,7 @@ class TestScheduledTasks(unittest.TestCase):
         self.assertIn("喝水提醒", result)
 
         # 验证任务已添加到文件
-        with open(self.temp_file.name, 'r', encoding='utf-8') as f:
+        with open(self.temp_file_name, 'r', encoding='utf-8') as f:
             tasks_data = json.load(f)
 
         self.assertEqual(len(tasks_data), 1)
@@ -137,7 +139,7 @@ class TestScheduledTasks(unittest.TestCase):
         from fluxagent.core.tools.builtins import list_scheduled_tasks
 
         # 确保文件为空
-        with open(self.temp_file.name, 'w') as f:
+        with open(self.temp_file_name, 'w') as f:
             f.write("")
 
         result = list_scheduled_tasks.invoke({})
@@ -184,12 +186,16 @@ class TestScheduledTasks(unittest.TestCase):
 class TestScheduledTasksWithTasks(unittest.TestCase):
 
     def setUp(self):
-        self.temp_tasks_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json')
+        # 句柄立即关闭：任务写入用 os.replace 原子替换，Windows 不允许
+        # 替换仍被打开的文件。
+        handle = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json')
+        self.temp_tasks_file_name = handle.name
+        handle.close()
 
         # 设置临时任务文件路径
         self.original_tasks_file = TASKS_FILE
         import fluxagent.core.tools.builtins
-        fluxagent.core.tools.builtins.TASKS_FILE = self.temp_tasks_file.name
+        fluxagent.core.tools.builtins.TASKS_FILE = self.temp_tasks_file_name
 
         # 添加一些测试任务
         future_time = (datetime.now().replace(hour=9, minute=0, second=0)
@@ -217,14 +223,13 @@ class TestScheduledTasksWithTasks(unittest.TestCase):
             }
         ]
 
-        with open(self.temp_tasks_file.name, 'w', encoding='utf-8') as f:
+        with open(self.temp_tasks_file_name, 'w', encoding='utf-8') as f:
             json.dump(test_tasks, f, ensure_ascii=False, indent=2)
 
     def tearDown(self):
         # 清理临时文件
-        self.temp_tasks_file.close()
-        if os.path.exists(self.temp_tasks_file.name):
-            os.unlink(self.temp_tasks_file.name)
+        if os.path.exists(self.temp_tasks_file_name):
+            os.unlink(self.temp_tasks_file_name)
         # 恢复原始路径
         import fluxagent.core.tools.builtins
         fluxagent.core.tools.builtins.TASKS_FILE = self.original_tasks_file

@@ -11,6 +11,7 @@ import os
 import json
 import uuid
 import threading
+from typing import Optional
 from ..config import MEMORY_DIR, TASKS_FILE
 from ..installer import (
     InstallError,
@@ -19,6 +20,7 @@ from ..installer import (
     list_installed_mcp_servers as load_installed_mcp_servers,
 )
 from ..safe_calc import safe_calculate
+from ..task_storage import write_tasks_atomic
 from .sandbox_tools import (
     list_office_files,
     read_office_file,
@@ -29,6 +31,9 @@ from .sandbox_tools import (
 
 tasks_lock = threading.Lock()
 PROFILE_PATH = os.path.join(MEMORY_DIR, "user_profile.md")
+
+# 定时任务循环频率白名单；repeat_count 提供 repeat 才有意义
+_VALID_REPEATS = frozenset({"hourly", "daily", "weekly", "monthly"})
 
 
 @fluxagent_tool
@@ -61,6 +66,23 @@ def save_user_profile(new_content: str) -> str:
         f.write(new_content)
 
     return "记忆档案已成功覆写更新。新的人设画像已生效。"
+
+
+@fluxagent_tool
+def read_user_profile() -> str:
+    """
+    读取用户的全局显性记忆档案（user_profile.md）。
+    在回答个性化问题、或准备调用 save_user_profile 修改档案之前，先调用此工具
+    获取当前完整档案，避免凭记忆猜测或误覆盖用户的长期偏好。
+    """
+    if not os.path.exists(PROFILE_PATH):
+        return "（用户档案暂无记录）"
+    try:
+        with open(PROFILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read().strip()
+        return content or "（用户档案暂无记录）"
+    except OSError as e:
+        return f"读取档案失败：{e}"
 
 
 @fluxagent_tool
@@ -184,7 +206,7 @@ def list_installed_mcp_servers() -> str:
 
 
 @fluxagent_tool
-def schedule_task(target_time: str, description: str, repeat: str = None, repeat_count: int = None) -> str:
+def schedule_task(target_time: str, description: str, repeat: Optional[str] = None, repeat_count: Optional[int] = None) -> str:
     """
     为一个未来的任务设定闹钟或提醒。
     参数 target_time 必须是严格的格式："YYYY-MM-DD HH:MM:SS"（请先调用 get_current_time 获取当前时间，并在其基础上推算）。
@@ -220,6 +242,20 @@ def schedule_task(target_time: str, description: str, repeat: str = None, repeat
             f" 你传入的是：{target_time}"
         )
 
+    # 循环参数校验：非法参数在触碰任务文件之前就拒绝，避免污染既有记录
+    if repeat is not None:
+        repeat = str(repeat).strip().casefold() or None
+        if repeat is not None and repeat not in _VALID_REPEATS:
+            return (
+                "设定失败：repeat 仅支持 "
+                f"{', '.join(sorted(_VALID_REPEATS))}；收到：{repeat}"
+            )
+    if repeat is None and repeat_count is not None:
+        return "设定失败：repeat_count 必须与 repeat 搭配使用，单次任务不接受 repeat_count。"
+    if repeat_count is not None:
+        if isinstance(repeat_count, bool) or not isinstance(repeat_count, int) or repeat_count < 1:
+            return "设定失败：repeat_count 必须是大于等于 1 的整数。"
+
     with tasks_lock:
         tasks = []
         if os.path.exists(TASKS_FILE):
@@ -241,8 +277,7 @@ def schedule_task(target_time: str, description: str, repeat: str = None, repeat
         tasks.append(new_task)
 
         try:
-            with open(TASKS_FILE, "w", encoding="utf-8") as f:
-                json.dump(tasks, f, ensure_ascii=False, indent=2)
+            write_tasks_atomic(TASKS_FILE, tasks)
         except Exception as e:
             return f"设定失败：写入任务队列异常 {str(e)}"
 
@@ -313,10 +348,9 @@ def delete_scheduled_task(task_id: str) -> str:
             
             if len(new_tasks) == len(tasks):
                 return f"删除失败：未找到 ID 为 {task_id} 的任务。"
-            
-            with open(TASKS_FILE, "w", encoding="utf-8") as f:
-                json.dump(new_tasks, f, ensure_ascii=False, indent=2)
-            
+
+            write_tasks_atomic(TASKS_FILE, new_tasks)
+
             return f" 任务 [ID: {task_id}] 已成功取消。"
         except Exception as e:
             return f"操作异常：{str(e)}"
@@ -368,10 +402,9 @@ def modify_scheduled_task(task_id: str, new_time: str = None, new_description: s
             
             if not found:
                 return f"修改失败：未找到 ID 为 {task_id} 的任务。"
-            
-            with open(TASKS_FILE, "w", encoding="utf-8") as f:
-                json.dump(tasks, f, ensure_ascii=False, indent=2)
-                
+
+            write_tasks_atomic(TASKS_FILE, tasks)
+
             return f" 任务 [ID: {task_id}] 已成功更新。"
         except ValueError:
             return "修改失败：时间格式错误。"
@@ -385,6 +418,7 @@ BUILTIN_TOOLS = [
     install_skill,
     install_mcp_server,
     list_installed_mcp_servers,
+    read_user_profile,
     save_user_profile,
     list_office_files,
     read_office_file,

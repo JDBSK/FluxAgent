@@ -137,54 +137,71 @@ def make_plan_step(step_id: int, action: str, status: str = STEP_PENDING, note: 
 
 
 def advance_plan(
-    task_plan: list[dict[str, Any]],
-    step_index: int,
-    outcome: str = STEP_DONE,
-    note: str = "",
+    task_plan : list[dict[str, Any]],
+    step_index: int,                    # 当前执行到的的步骤索引，0表示第一步
+    outcome   : str = STEP_DONE,        # 当前步骤的执行结果，STEP_DONE/STEP_FAILED
+    note      : str = "",
 ) -> tuple[list[dict[str, Any]], int, str]:
     """把当前步标记完成/失败并推进游标，返回 (新计划, 新游标, 任务状态)。
-
+    
+    函数名称来源是“推进计划”，因为它会把当前步骤标记为完成/失败，并根据结果推进游标到下一步或保持不变。
     纯函数，不碰 LLM，方便单测；节点只负责把结果写回 state。
     """
+    # 没有计划就直接返回，避免越界
     if not task_plan:
         return [], step_index, TASK_RUNNING
 
     plan = [dict(s) for s in task_plan]
     idx = max(0, min(step_index, len(plan) - 1))
-    plan[idx]["status"] = outcome
+    plan[idx]["status"] = outcome  # 标记当前步骤的执行结果，outcome的来源是节点执行结果
     if note:
         plan[idx]["note"] = note
 
     if outcome == STEP_FAILED:
+        # 当前步骤失败，任务状态变为 TASK_FAILED，游标不推进
         return plan, idx, TASK_FAILED
 
+    # 当前步骤完成，推进游标到下一步
     next_idx = idx + 1
     if next_idx >= len(plan):
+        # 当前步骤是最后一步，任务状态变为 TASK_DONE
         return plan, len(plan) - 1, TASK_DONE
+
+    # 计划未完成，还有下一步，标记下一步为运行中
     plan[next_idx]["status"] = STEP_RUNNING
     return plan, next_idx, TASK_RUNNING
 
 
 def render_plan(task_plan: list[dict[str, Any]], step_index: int) -> str:
     """把计划渲染成给 LLM 看的进度块，让它知道自己在第几步，而不是从历史里猜。"""
+    # 函数的作用是将任务计划渲染为一个文本块，显示每个步骤的状态和当前执行的步骤索引。这样可以让 LLM 清楚地了解任务的进度，而不需要从历史消息中推测。
+    # 发给 LLM 的 plan_block 里，当前步骤的状态是 STEP_RUNNING，其他步骤的状态是 STEP_PENDING/STEP_DONE/STEP_FAILED。
     if not task_plan:
         return ""
-    marks = {STEP_DONE: "[x]", STEP_FAILED: "[!]",
-             STEP_RUNNING: "[>]", STEP_PENDING: "[ ]"}
+    
+    marks = {
+        STEP_DONE   : "[x]",  # 已完成
+        STEP_FAILED : "[!]",  # 失败
+        STEP_RUNNING: "[>]",  # 正在执行
+        STEP_PENDING: "[ ]",  # 未开始
+    }
     lines = []
+
     for i, step in enumerate(task_plan):
-        mark = marks.get(step.get("status", STEP_PENDING), "[ ]")
-        cursor = " <= 当前" if i == step_index else ""
+        mark = marks.get(step.get("status", STEP_PENDING), "[ ]")  # 默认任务未开始 
+        cursor = " <= 当前" if i == step_index else ""  # 用于标记当前执行步骤是否是游标指向的步骤
         lines.append(f"{mark} {i + 1}. {step.get('action', '')}{cursor}")
+
     return "\n".join(lines)
 
 
 def measure_context(messages: list[BaseMessage]) -> dict[str, int]:
-    """Return deterministic context-size proxies without a model tokenizer."""
+    """返回确定性的上下文大小代理，而不依赖模型的 tokenizer。"""
+
     return {
-        "turns": sum(isinstance(message, HumanMessage) for message in messages),
-        "messages": len(messages),
-        "characters": sum(len(str(getattr(message, "content", ""))) for message in messages),
+        "turns": sum(isinstance(message, HumanMessage) for message in messages),  # 用户回合数
+        "messages": len(messages),  # 消息总数
+        "characters": sum(len(str(getattr(message, "content", ""))) for message in messages),  # 消息内容总字符数
     }
 
 

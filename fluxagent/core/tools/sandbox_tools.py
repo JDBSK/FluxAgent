@@ -5,6 +5,12 @@ The filesystem boundary is enforced with both lexical and resolved paths so
 prefix collisions, symlinks, and Windows junctions cannot escape OFFICE_DIR.
 Commands are parsed into argv and executed with ``shell=False``; shell syntax,
 absolute paths, URLs, and inline interpreter code are rejected before launch.
+
+Compound commands (``&&``, ``||``, ``|``, ``>``, ``>>``) are executed by a
+small built-in mini-shell: only built-in commands (echo/dir/ls/cat/type/
+grep/findstr/mkdir/md) may participate, so external interpreters never gain
+pipe/redirection composition. External allow-listed executables remain
+single-command only.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import signal
 import subprocess
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import BinaryIO
 
 from .base import fluxagent_tool
@@ -36,7 +43,7 @@ MAX_DIRECTORY_ENTRIES = 1000
 _ALLOWED_EXECUTABLES = frozenset(
     {
         "dir", "echo", "git", "ls", "node", "node.exe", "npm", "npm.cmd", "npx", "npx.cmd",
-        "pip", "pip.exe", "pip3", "pip3.exe", "pytest", "pytest.exe",
+        "pytest", "pytest.exe",
         "python", "python.exe", "python3", "python3.exe", "uv", "uv.exe",
     }
 )
@@ -140,6 +147,10 @@ def _parse_command(command: str) -> list[str]:
     ]
     if not args:
         raise ValueError("命令不能为空。")
+    # 命令名不得携带路径前缀（./python、/usr/bin/ls、bin\\ls 等）：
+    # basename 归一化会把它们伪装成白名单命令，必须原样拒绝。
+    if any(separator in args[0] for separator in ("/", "\\")) or ":" in args[0]:
+        raise PermissionError("命令名不得携带路径前缀")
     executable = ntpath.basename(args[0]).casefold()
     if executable not in _ALLOWED_EXECUTABLES:
         raise PermissionError(f"命令不在允许列表中：{args[0]}")
@@ -156,6 +167,257 @@ def _parse_command(command: str) -> list[str]:
         raise FileNotFoundError(f"找不到允许的可执行文件：{args[0]}")
     args[0] = resolved
     return args
+
+
+# ============ 复合命令 mini-shell（仅内置命令可参与） ============
+
+# 复合命令允许的内置命令：语义完全由本模块实现，外部二进制不参与管道/重定向
+_COMPOUND_BUILTINS = frozenset(
+    {"echo", "dir", "ls", "cat", "type", "grep", "findstr", "mkdir", "md"}
+)
+
+# 这些字符在 token 层一律封死：`;` `<` 反引号 `$` `^` `!` 与换行。
+# 解释权在本模块而非系统 shell，直接拒绝可避免"展开后检查"窗口。
+_TOKEN_FORBIDDEN = re.compile(r"[;<`$^!\r\n]")
+# cmd 风格 %VAR% 成对展开（孤立 % 不算变量）
+_CMDVAR_PATTERN = re.compile(r"%[^%\s]{1,}%")
+
+
+def _tokenize_compound(text: str) -> list[tuple[str, str]]:
+    """把命令文本切成 word/op token；引号内不识别运算符。
+
+    Returns:
+        token 列表，元素为 (kind, value)，kind 为 "word" 或 "op"，
+        op 取值 "&&" "||" "|" ">" ">>"。
+
+    Raises:
+        PermissionError / ValueError: 出现被封死的字符、引号不完整或非法运算符。
+    """
+    if _CMDVAR_PATTERN.search(text):
+        raise PermissionError("检测到 cmd 变量展开语法（%VAR%），已封禁。")
+    tokens: list[tuple[str, str]] = []
+    i, length = 0, len(text)
+    while i < length:
+        char = text[i]
+        if char.isspace():
+            i += 1
+            continue
+        if _TOKEN_FORBIDDEN.match(char):
+            raise PermissionError(f"禁止的字符或语法：{char!r}。")
+        if char in "&|>":
+            if text.startswith("&&", i):
+                op = "&&"
+            elif text.startswith("||", i):
+                op = "||"
+            elif text.startswith(">>", i):
+                op = ">>"
+            elif char in "|>":
+                op = char
+            else:
+                raise PermissionError("不允许单个 & 字符。")
+            end = i + len(op)
+            if end < length and text[end] in "&|>":
+                raise PermissionError("无效的运算符组合。")
+            tokens.append(("op", op))
+            i = end
+            continue
+        parts: list[str] = []
+        while i < length and not text[i].isspace() and text[i] not in "&|>":
+            char = text[i]
+            if char in "\"'":
+                close = text.find(char, i + 1)
+                if close == -1:
+                    raise ValueError(f"命令引号不完整：{text[:40]}")
+                parts.append(text[i + 1:close])
+                i = close + 1
+                continue
+            if _TOKEN_FORBIDDEN.match(char):
+                raise PermissionError(f"禁止的字符或语法：{char!r}。")
+            parts.append(char)
+            i += 1
+        tokens.append(("word", "".join(parts)))
+    return tokens
+
+
+@dataclass
+class _Stage:
+    name: str
+    args: list[str]
+
+
+@dataclass
+class _CompoundCommand:
+    connector: str            # 与上一条命令的关系："", "&&", "||"
+    stages: list[_Stage]      # 用 | 串起来的管道段
+    redirect: tuple[str, str] | None = None  # (">" 或 ">>", 目标文件)
+
+
+def _plan_compound(tokens: list[tuple[str, str]]) -> list[_CompoundCommand]:
+    """把 token 流组装成复合命令计划，并完成白名单与参数校验。"""
+    commands: list[_CompoundCommand] = []
+    connector = ""
+    stages: list[_Stage] = []
+    current: list[str] = []
+    redirect: tuple[str, str] | None = None
+    pending_redirect: str | None = None
+
+    def close_stage() -> None:
+        nonlocal current
+        if not current:
+            raise ValueError("复合命令中存在空的命令段。")
+        head = current[0].casefold()
+        if head not in _COMPOUND_BUILTINS:
+            raise PermissionError(
+                f"复合命令仅允许内置命令 {sorted(_COMPOUND_BUILTINS)}，"
+                f"不允许：{current[0]}。外部命令必须单独执行。"
+            )
+        for arg in current[1:]:
+            if not _safe_argument_path(arg):
+                raise PermissionError(f"参数越界：{arg}。所有路径必须限制在 office 工位内。")
+        stages.append(_Stage(head, list(current[1:])))
+        current = []
+
+    def close_command() -> None:
+        nonlocal stages, redirect, connector
+        close_stage()
+        commands.append(_CompoundCommand(connector, stages, redirect))
+        stages = []
+        redirect = None
+        connector = ""
+
+    for kind, value in tokens:
+        if kind == "word":
+            if pending_redirect is not None:
+                if redirect is not None:
+                    raise ValueError("一条命令只允许一个输出重定向。")
+                redirect = (pending_redirect, value)
+                pending_redirect = None
+                continue
+            current.append(value)
+            continue
+        if pending_redirect is not None:
+            raise ValueError("重定向缺少目标文件。")
+        if value in ("&&", "||"):
+            close_command()
+            connector = value
+        elif value == "|":
+            if redirect is not None:
+                raise ValueError("重定向只能出现在管道末段之后。")
+            close_stage()
+        else:  # ">" 或 ">>"
+            if redirect is not None:
+                raise ValueError("一条命令只允许一个输出重定向。")
+            pending_redirect = value
+    if pending_redirect is not None:
+        raise ValueError("重定向缺少目标文件。")
+    close_command()
+
+    if commands and commands[0].connector:
+        raise ValueError("复合命令不能以运算符开头。")
+    for command in commands:
+        if command.redirect is not None and not _safe_argument_path(command.redirect[1]):
+            raise PermissionError(
+                f"重定向目标越界：{command.redirect[1]}。输出必须落在 office 工位内。"
+            )
+    return commands
+
+
+def _read_stage_files(paths: list[str]) -> tuple[list[str], list[str]]:
+    """批量读取 office 内文件行，返回 (lines, errors)；单文件失败不中断其余。"""
+    lines: list[str] = []
+    errors: list[str] = []
+    for path in paths:
+        try:
+            resolved = _get_safe_path(path)
+            if not os.path.isfile(resolved):
+                errors.append(f"文件不存在：{path}")
+                continue
+            if os.path.getsize(resolved) > MAX_READ_BYTES:
+                errors.append(f"文件超过 {MAX_READ_BYTES} 字节读取限制：{path}")
+                continue
+            with open(resolved, "r", encoding="utf-8", errors="replace") as handle:
+                lines.extend(handle.read(MAX_READ_BYTES).splitlines())
+        except (PermissionError, OSError) as exc:
+            errors.append(str(exc))
+    return lines, errors
+
+
+def _run_builtin_stage(stage: _Stage, stdin_text: str | None) -> tuple[int, str, str]:
+    """执行一个内置命令段，返回 (returncode, stdout, stderr)；不抛异常。"""
+    name, args = stage.name, stage.args
+    try:
+        if name == "echo":
+            return 0, " ".join(args) + "\n", ""
+        if name in ("dir", "ls"):
+            relative = args[0] if args else "."
+            target = _get_safe_path(relative)
+            if not os.path.isdir(target):
+                return 1, "", f"不是目录：{relative}"
+            return 0, "\n".join(sorted(os.listdir(target))) + "\n", ""
+        if name in ("cat", "type"):
+            if not args:
+                if stdin_text is None:
+                    return 1, "", "cat: 缺少文件参数且无管道输入。"
+                return 0, stdin_text, ""
+            lines, errors = _read_stage_files(args)
+            body = "".join(line + "\n" for line in lines)
+            return (1 if errors and not lines else 0), body, "\n".join(errors)
+        if name in ("grep", "findstr"):
+            if not args:
+                return 2, "", "grep: 缺少 pattern 参数。"
+            pattern, files = args[0], args[1:]
+            if files:
+                lines, errors = _read_stage_files(files)
+                if errors and not lines:
+                    return 1, "", "\n".join(errors)
+            else:
+                if stdin_text is None:
+                    return 2, "", "grep: 缺少文件参数且无管道输入。"
+                lines, errors = stdin_text.splitlines(), []
+            matched = [line for line in lines if pattern in line]
+            body = "".join(line + "\n" for line in matched)
+            return (0 if matched else 1), body, "\n".join(errors)
+        if name in ("mkdir", "md"):
+            if len(args) != 1:
+                return 1, "", "mkdir: 需要恰好一个目录参数。"
+            target = _get_safe_path(args[0])
+            os.mkdir(target)
+            return 0, "", ""
+        return 127, "", f"未知内置命令：{name}"
+    except FileExistsError:
+        return 1, "", f"mkdir: 目录已存在：{args[0] if args else ''}"
+    except (PermissionError, OSError, ValueError) as exc:
+        return 1, "", str(exc)
+
+
+def _run_compound(commands: list[_CompoundCommand]) -> tuple[int, str, str]:
+    """按 && / || / 管道 / 重定向语义执行内置命令计划。"""
+    stderr_parts: list[str] = []
+    last_rc = 0
+    final_stdout = ""
+    for command in commands:
+        if command.connector == "&&" and last_rc != 0:
+            continue
+        if command.connector == "||" and last_rc == 0:
+            continue
+        stdin_text: str | None = None
+        for stage in command.stages:
+            returncode, stdout, stderr = _run_builtin_stage(stage, stdin_text)
+            # 管道内 stdin 始终是字符串：上一段输出为空时是空管道（EOF），不是"无管道"
+            stdin_text = (stdout or "")[:MAX_SHELL_OUTPUT_BYTES]
+            if stderr:
+                stderr_parts.append(stderr)
+            last_rc = returncode
+        if command.redirect is not None:
+            mode, target = command.redirect
+            resolved = _get_safe_path(target)
+            os.makedirs(os.path.dirname(resolved), exist_ok=True)
+            with open(resolved, "w" if mode == ">" else "a", encoding="utf-8") as handle:
+                handle.write(stdin_text or "")
+            final_stdout = f"(stdout 已重定向{'追加' if mode == '>>' else '写入'} {target})"
+        else:
+            final_stdout = stdin_text or ""
+    return last_rc, final_stdout, "\n".join(stderr_parts)
 
 
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
@@ -349,12 +611,44 @@ def write_office_file(filepath: str, content: str, mode: str = "w") -> str:
         return _tool_error("filesystem_error", str(exc), retryable=True)
 
 
+def _has_unquoted_operator(text: str) -> bool:
+    """Return whether & | > appears outside quotes in the command text."""
+    quote: str | None = None
+    for char in text:
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in "&|>":
+            return True
+    return False
+
+
+def _uses_compound_path(command: str) -> bool:
+    """复合路径判定：含未加引号的运算符，或首词是 mini-shell 内置命令。
+
+    内置命令（echo/dir/ls/cat/type/grep/findstr/mkdir/md）的语义完全由本模块
+    实现，统一走复合执行器；其余命令保持原 argv 白名单单命令路径。
+    """
+    stripped = str(command or "").strip()
+    if not stripped:
+        return False
+    head = stripped.split(None, 1)[0].strip("\"'").casefold()
+    return head in _COMPOUND_BUILTINS or _has_unquoted_operator(stripped)
+
+
 @fluxagent_tool
 def execute_office_shell(command: str) -> str:
     """Run one allow-listed argv command inside office without a command shell."""
     try:
-        args = _parse_command(command)
-        returncode, stdout, stderr = _run_command(args)
+        if _uses_compound_path(command):
+            plan = _plan_compound(_tokenize_compound(command))
+            returncode, stdout, stderr = _run_compound(plan)
+        else:
+            args = _parse_command(command)
+            returncode, stdout, stderr = _run_command(args)
         if returncode != 0:
             return _tool_error("command_failed", f"命令退出码 {returncode}：{(stderr or stdout)[-1000:]}")
         output = (

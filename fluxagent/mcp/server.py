@@ -39,7 +39,7 @@ def build_server(allow_side_effects: bool = False, include_skills: bool = True) 
         # 同步工具放线程池：沙盒 shell 有 60s 超时，直接 await 会卡住事件循环
         text, is_error = await asyncio.to_thread(
             registry.call, params.name, params.arguments
-        )
+        )  # 在线程池中执行工具，避免阻塞事件循环
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=text)], isError=is_error
         )

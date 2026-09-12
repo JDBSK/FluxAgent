@@ -44,3 +44,10 @@ workspace/memory/*.md
 workspace/office
 
 *.egg-info/
+
+# Local agent configuration, reference checkouts, and evaluation scratch output
+.zcode/
+reference/
+_full_eval_log.txt
+_retest_*.txt
+_run_full_eval.cmd

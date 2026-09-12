@@ -32,7 +32,7 @@ from fluxagent.core.approval import (
     describe_calls,
 )
 from fluxagent.core.config import DB_PATH
-from fluxagent.core.bus import task_queue
+from fluxagent.core.bus import task_queue, stop_workers
 from fluxagent.core.heartbeat import pacemaker_loop
 from fluxagent.core.context import render_plan
 from fluxagent.core.permissions import PermissionManager
@@ -226,7 +226,6 @@ async def async_main():
         # Main input waits for each queued task to finish, so approval is the
         # only active terminal prompt while the graph is interrupted.
         approval_session = PromptSession()
-        stop_worker = object()
 
         async def agent_worker():
             """消费任务队列并驱动 Agent、工具调用及审批流程。"""
@@ -487,14 +486,9 @@ async def async_main():
             worker = asyncio.create_task(agent_worker())
             heartbeat_worker = asyncio.create_task(pacemaker_loop(task_queue=task_queue, check_interval=10))
             await user_input_loop()
-            # Stop producers first. Then drain already queued heartbeat tasks
-            # before placing a sentinel behind them for the sole consumer.
-            heartbeat_worker.cancel()
-            await asyncio.gather(heartbeat_worker, return_exceptions=True)
-            await task_queue.join()
-            await task_queue.put(stop_worker)
-            await task_queue.join()
-            await worker
+            # 退出排空：先停心跳生产者（取消后可能补投最后一个任务），
+            # 再发退出哨兵并 join，保证已入队工作全部处理完，消费者才退出。
+            await stop_workers(worker, heartbeat_worker, task_queue)
 
 def main():
     """启动异步终端应用。"""

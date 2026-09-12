@@ -80,7 +80,7 @@ async def _discover_server(record: dict[str, Any]) -> list[Any]:
     params = _server_params(record)
     async with stdio_client(params) as (reader, writer):
         async with ClientSession(reader, writer) as session:
-            await session.initialize()
+            await session.initialize()  # 初始化 MCP 客户端会话。
             result = await session.list_tools()
             return list(result.tools)
 
@@ -97,6 +97,7 @@ def _render_tool_result(server_name: str, tool_name: str, result: Any) -> str:
         else:
             parts.append(str(block))
     output = "\n".join(part for part in parts if part).strip()
+
     if not output:
         output = "MCP 工具调用完成，但没有返回文本内容。"
     if bool(getattr(result, "isError", False) or getattr(result, "is_error", False)):
@@ -118,7 +119,7 @@ async def _call_server_tool(
 
 def _make_tool(record: dict[str, Any], remote_tool: Any, exposed_name: str) -> BaseTool:
     # 创建一个本地工具实例，用于调用远程 MCP 工具。
-    server_name = str(record.get("name") or "unknown")
+    server_name = str(record.get("name") or "unknown")  # MCP 服务器的名称,unkonwn是兜底
     remote_name = str(remote_tool.name)
 
     async def invoke_remote(**kwargs: Any) -> str:
@@ -138,7 +139,7 @@ def _make_tool(record: dict[str, Any], remote_tool: Any, exposed_name: str) -> B
         )
 
     description = str(getattr(remote_tool, "description", "") or "").strip()
-    description = f"[MCP: {server_name}/{remote_name}] {description}".strip()
+    description = f"[MCP: {server_name}/{remote_name}] {description}".strip()  # 添加 MCP 服务器和工具的名称信息
     schema = (
         getattr(remote_tool, "input_schema", None)
         or getattr(remote_tool, "inputSchema", None)
@@ -146,7 +147,8 @@ def _make_tool(record: dict[str, Any], remote_tool: Any, exposed_name: str) -> B
             "type": "object",
             "properties": {},
         }
-    )
+    )  # 获取远程工具的输入参数 schema，如果没有则使用空对象 schema
+
     return StructuredTool.from_function(
         func=invoke_remote_sync,
         coroutine=invoke_remote,
@@ -157,7 +159,7 @@ def _make_tool(record: dict[str, Any], remote_tool: Any, exposed_name: str) -> B
             "capability": server_name,
             "aliases": [server_name, remote_name, *[str(x) for x in (record.get("aliases") or [])]],
             "kind": "mcp",
-        },
+        },  # metadata的作用是提供工具的额外信息，包括能力、别名和类型等，便于在 FluxAgent 中进行管理和调用。
     )
 
 

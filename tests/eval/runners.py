@@ -294,7 +294,12 @@ def run_twophase(case: dict[str, Any]) -> tuple[bool, str]:
         elif case["mode"] == "run":
             args["command"] = "echo hi"
 
-        out = str(tool.invoke(args))
+        try:
+            out = str(tool.invoke(args))
+        except Exception as exc:
+            # schema 层拒绝（如 mode 非法触发 pydantic ValidationError）同样
+            # 属于结构化错误：真实链路里 ToolNode 会把它转成错误 ToolMessage。
+            out = f"错误：{type(exc).__name__}: {str(exc)[:120]}"
         has_manual = "MANUAL_BODY_MARKER" in out
         errored = out.startswith("错误")
 
