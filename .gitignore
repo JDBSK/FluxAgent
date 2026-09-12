@@ -51,3 +51,5 @@ reference/
 _full_eval_log.txt
 _retest_*.txt
 _run_full_eval.cmd
+_tmp_*.cmd
+artifacts/

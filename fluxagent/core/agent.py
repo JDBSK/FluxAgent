@@ -81,6 +81,19 @@ from .recovery import (
 from .skill_loader import load_dynamic_skills
 from .tools.builtins import BUILTIN_TOOLS
 
+from ..capability.context_compiler import (
+    CompilationContext,
+    ContextCompiler,
+    MemoryStore,
+    ProfileCompatProvider,
+)
+from ..capability.descriptors import CapabilityDescriptor
+from ..capability.gateway import CircuitBreaker, ExecutionGateway
+from ..capability.providers import descriptors_from_tools
+from ..capability.registry import CapabilityRegistry, RegistryError, RegistrySnapshot
+from ..capability.retrieval import load_embedding_provider
+from ..capability.router import HybridRouter, InvocationContract, RouteDecision
+
 MAX_RETRY              = 3                                                   # 单个步骤的最大重试次数，超过则进入 replan
 MAX_REPLAN             = 2                                                   # 单个任务的最大重规划次数，超过则失败
 # These tools terminate an installation *step* after a successful transaction;
@@ -268,49 +281,48 @@ def _routing_terms(value: Any) -> set[str]:
 
 
 def _relevant_tool_subset(user_text: str, tools: list[BaseTool]) -> list[BaseTool]:
-    """Retrieve the most relevant capability groups from tool metadata.
+    """Hybrid RAG 检索最相关的能力组（BM25 + dense + RRF + 启发式重排）。
 
-    This is deliberately service-agnostic. It is a lightweight local retrieval
-    layer; an embedding or enterprise search index can replace the scoring
-    implementation without changing loaders or routing contracts.
+    这是轻量级本地实现；embedding provider 默认为确定性本地向量，可通过
+    capability 配置替换为远程服务。与旧词面检索的关键差异：
+    - 检索对象是统一能力卡（Registry descriptor），不是工具名字符串；
+    - 无证据时不再返回全量工具，只保留非外部（builtin）工具，杜绝
+      "把所有 MCP 交给模型猜"的失败模式。
     """
-    query_terms = _routing_terms(user_text)
-    if not query_terms:
-        return tools
-    groups: dict[str, list[BaseTool]] = {}
-    profiles: dict[str, set[str]] = {}
-    for tool in tools:
-        metadata = getattr(tool, "metadata", None) or {}
-        capability = str(metadata.get("capability") or "").strip()
-        if not capability:
-            capability = str(tool.name)
-        groups.setdefault(capability, []).append(tool)
-        profile = profiles.setdefault(capability, set())
-        profile.update(_routing_terms(capability))
-        profile.update(_routing_terms(tool.name))
-        profile.update(_routing_terms(getattr(tool, "description", "")))
-        for alias in metadata.get("aliases") or []:
-            profile.update(_routing_terms(alias))
+    query_text = str(user_text or "").strip()
+    registry = CapabilityRegistry()
+    for descriptor in descriptors_from_tools(tools):
+        try:
+            registry.register(descriptor)
+        except RegistryError as exc:
+            # 单个坏描述 fail-closed：该能力不可用，但不拖垮整体检索
+            audit_logger.log_event(
+                thread_id="system_default",
+                event="system_action",
+                action="capability_register_failed",
+                capability=descriptor.capability_id,
+                error=str(exc)[:200],
+            )
+    snapshot = registry.snapshot()
+    router = HybridRouter(embedding_provider=load_embedding_provider(None))
+    router.rebuild_index(snapshot)
+    decision = router.decide(query_text, snapshot)
 
-    scores = {
-        capability: len(query_terms & profile)
-        for capability, profile in profiles.items()
-    }
-    best_score = max(scores.values(), default=0)
-    if best_score <= 0:
-        return tools
-
-    selected: list[BaseTool] = []
-    for capability, group in groups.items():
-        # Built-ins without capability metadata remain available for ordinary
-        # local actions; external capability groups are narrowed by relevance.
-        has_external_metadata = any(
-            (getattr(tool, "metadata", None) or {}).get("kind") in {"mcp", "skill"}
-            for tool in group
-        )
-        if not has_external_metadata or scores.get(capability, 0) == best_score:
-            selected.extend(group)
-    return selected or tools
+    name_to_tool = {str(tool.name): tool for tool in tools}
+    if decision.route == "route":
+        selected = [
+            name_to_tool[name]
+            for name in decision.allowed_tool_ids
+            if name in name_to_tool
+        ]
+        if selected:
+            return selected
+    # abstain / 无匹配：只保留非外部工具（builtin），外部能力全部不开放
+    return [
+        tool
+        for tool in tools
+        if str((getattr(tool, "metadata", None) or {}).get("kind") or "") not in {"mcp", "skill"}
+    ]
 
 
 def _route_observation(user_text: str, tools: list[BaseTool], selected: list[BaseTool]) -> dict[str, Any]:
@@ -445,6 +457,9 @@ def create_agent_app(
     subagent_specs: Optional[list] = None,
     allow_dynamic_subagents: bool = True,
     dynamic_subagent_tools: Optional[List[BaseTool]] = None,
+    capability_registry: Optional[CapabilityRegistry] = None,
+    memory_store: Optional[MemoryStore] = None,
+    context_compiler: Optional[ContextCompiler] = None,
 ):
     """创建并编译 Agent 状态图应用。
 
@@ -483,7 +498,19 @@ def create_agent_app(
         raise ValueError(
             "context_keep_turns must be smaller than context_trigger_turns")
 
-    if tools is None:
+    if capability_registry is not None:
+        # 统一 Registry 是唯一事实源：可执行工具来自 descriptor 的 operation；
+        # prompt_skill 只有上下文通道，不产生任何执行工具。
+        registry_snapshot = capability_registry.snapshot()
+        derived_tools: list[BaseTool] = []
+        seen_names: set[str] = set()
+        for capability in registry_snapshot.capabilities:
+            for operation in capability.operations:
+                if operation.tool is not None and operation.name not in seen_names:
+                    seen_names.add(operation.name)
+                    derived_tools.append(operation.tool)
+        actual_tools = derived_tools
+    elif tools is None:
         dynamic_tools = load_dynamic_skills()
         actual_tools = BUILTIN_TOOLS + dynamic_tools
     else:
@@ -512,6 +539,218 @@ def create_agent_app(
         raise ValueError("工具名称冲突：内置工具、技能与委派工具必须使用唯一名称")
 
     tool_node = ToolNode(actual_tools)
+
+    # ---------- 统一能力控制面：Registry / Router / Compiler / Gateway ----------
+    if capability_registry is None:
+        capability_registry = CapabilityRegistry()
+        for descriptor in descriptors_from_tools(actual_tools):
+            try:
+                capability_registry.register(descriptor)
+            except RegistryError as exc:
+                audit_logger.log_event(
+                    thread_id="system_default",
+                    event="system_action",
+                    action="capability_register_failed",
+                    capability=descriptor.capability_id,
+                    error=str(exc)[:200],
+                )
+    _router = HybridRouter(embedding_provider=load_embedding_provider(None))
+    _router.rebuild_index(capability_registry.snapshot())
+
+    if memory_store is None:
+        memory_store = MemoryStore()
+    try:
+        ProfileCompatProvider(os.path.join(MEMORY_DIR, "user_profile.md")).load_into(
+            memory_store
+        )
+    except Exception as exc:  # noqa: BLE001 - 画像不可用时记忆为空，不阻断启动
+        audit_logger.log_event(
+            thread_id="system_default",
+            event="system_action",
+            action="profile_memory_load_failed",
+            error=str(exc)[:200],
+        )
+    if context_compiler is None:
+        context_compiler = ContextCompiler(memory_store, token_budget=2400)
+
+    _breaker = CircuitBreaker()
+    # 每会话缓存本回合路由结果：(thread_id -> (user_text, decision, contract, scoped, label))
+    _turn_scopes: dict[str, tuple] = {}
+    _router_lock = threading.RLock()
+
+    def _always_tools() -> list[BaseTool]:
+        """非外部（builtin）工具：每回合始终可见，与能力路由无关。"""
+        snapshot = capability_registry.snapshot()
+        external_names = {
+            op.name
+            for capability in snapshot.capabilities
+            if capability.kind in {"mcp", "executable_skill"}
+            for op in capability.operations
+        }
+        return [tool for tool in actual_tools if str(tool.name) not in external_names]
+
+    def _dedupe_tools(tools: list[BaseTool]) -> list[BaseTool]:
+        """按工具名去重（StructuredTool 不可哈希）。"""
+        seen: set[str] = set()
+        unique: list[BaseTool] = []
+        for tool in tools:
+            name = str(tool.name)
+            if name not in seen:
+                seen.add(name)
+                unique.append(tool)
+        return unique
+
+    def _match_capability_explicit(
+        user_text: str, snapshot: RegistrySnapshot
+    ) -> Optional[str]:
+        """在 Registry 别名上做显式匹配（语义与 _explicit_tool_scope 一致）。
+
+        返回 capability_id；"" 表示显式信号存在但无法唯一解析（fail closed）；
+        None 表示没有显式路由信号，应走 Hybrid 检索。
+        """
+        text = str(user_text or "").casefold()
+        alias_map: dict[str, set[str]] = {}
+        for capability in snapshot.enabled_capabilities():
+            terms: set[str] = set()
+            for source in (capability.capability_id, capability.name, *capability.aliases):
+                terms.update(_metadata_aliases(source))
+            for operation in capability.operations:
+                terms.update(_metadata_aliases(operation.name))
+            for term in terms:
+                alias_map.setdefault(term, set()).add(capability.capability_id)
+        matches: list[tuple[int, str]] = []
+        for term, capability_ids in alias_map.items():
+            if len(term) >= 2 and len(capability_ids) == 1 and term in text:
+                matches.append((len(term), next(iter(capability_ids))))
+        if matches:
+            matches.sort(reverse=True)
+            best_len = matches[0][0]
+            best = {cap_id for length, cap_id in matches if length == best_len}
+            if len(best) == 1:
+                return next(iter(best))
+            return ""
+        if _explicit_backend_hint(user_text):
+            return ""
+        return None
+
+    def _turn_contract(
+        thread_id: str, user_text: str
+    ) -> tuple[RouteDecision, InvocationContract, list[BaseTool], str]:
+        """解析本回合的最小工具集合；同一用户回合内缓存复用。"""
+        with _router_lock:
+            cached = _turn_scopes.get(thread_id)
+            if cached and cached[0] == user_text:
+                return cached[1], cached[2], cached[3], cached[4]
+
+            snapshot = capability_registry.snapshot()
+            explicit = _match_capability_explicit(user_text, snapshot)
+            always = _always_tools()
+            if explicit is not None:
+                if explicit:
+                    capability = snapshot.get(explicit)
+                    operations = list(capability.operations) if capability else []
+                    scoped = [
+                        op.tool for op in operations if op.tool is not None
+                    ]
+                    scoped = _dedupe_tools(scoped)
+                    label = explicit
+                    if capability is not None and capability.kind == "prompt_skill":
+                        # Prompt Skill：零工具，只注入受限上下文
+                        decision = RouteDecision(
+                            route="route",
+                            intent=capability.intents[0] if capability.intents else explicit,
+                            capability_ids=(explicit,),
+                            registry_version=snapshot.version,
+                            memory_scopes=("user_fact", "user_preference", "skill_context"),
+                            reason=f"显式路由到 Prompt Skill {explicit}",
+                            audit={"path": "explicit", "kind": "prompt_skill"},
+                        )
+                        contract = InvocationContract(decision=decision, tools={})
+                        scoped = []
+                    else:
+                        decision = RouteDecision(
+                            route="route" if scoped else "clarify",
+                            intent=explicit,
+                            capability_ids=(explicit,) if capability else (),
+                            allowed_tool_ids=tuple(str(t.name) for t in scoped),
+                            registry_version=snapshot.version,
+                            memory_scopes=("user_fact", "user_preference", "task_state"),
+                            reason=f"显式路由到 {explicit}",
+                            audit={"path": "explicit"},
+                        )
+                        contract = InvocationContract(
+                            decision=decision,
+                            tools={str(t.name): t for t in scoped},
+                        )
+                else:
+                    label = _explicit_backend_hint(user_text) or "explicit_unresolved"
+                    decision = RouteDecision(
+                        route="clarify",
+                        intent="explicit_backend_unresolved",
+                        registry_version=snapshot.version,
+                        reason="显式指定的能力无法唯一解析或未注册",
+                        audit={"path": "explicit", "requested": label},
+                    )
+                    contract = InvocationContract(decision=decision, tools={})
+                    scoped = []
+            else:
+                decision = _router.decide(user_text, snapshot)
+                contract = _router.build_contract(decision, snapshot)
+                label = ""
+                # 常驻 builtin 工具并入契约：路由只决定"外部能力"的最小集合，
+                # 本地动作（时间/计算/文件读写等）始终可用且必须过同一网关。
+                merged_tools: dict[str, BaseTool] = {
+                    str(tool.name): tool for tool in always
+                }
+                merged_tools.update(contract.tools)
+                decision = RouteDecision(
+                    route=decision.route,
+                    intent=decision.intent,
+                    capability_ids=decision.capability_ids,
+                    operation_ids=decision.operation_ids,
+                    allowed_tool_ids=tuple(merged_tools.keys()),
+                    evidence_ids=decision.evidence_ids,
+                    missing_slots=decision.missing_slots,
+                    memory_scopes=decision.memory_scopes,
+                    registry_version=decision.registry_version,
+                    index_version=decision.index_version,
+                    reason=decision.reason,
+                    audit=decision.audit,
+                )
+                contract = InvocationContract(decision=decision, tools=merged_tools)
+                scoped = list(merged_tools.values())
+
+            scoped = _dedupe_tools(scoped)
+            _turn_scopes[thread_id] = (user_text, decision, contract, scoped, label)
+            return decision, contract, scoped, label
+
+    def _gateway_for(thread_id: str, user_text: str) -> ExecutionGateway:
+        """本回合执行网关：契约 + 注册表快照 + 共享熔断器。"""
+        decision, contract, _scoped, _label = _turn_contract(thread_id, user_text)
+        return ExecutionGateway(
+            contract, capability_registry.snapshot(), breaker=_breaker
+        )
+
+    def _turn_contract_cached_tools(
+        thread_id: str, user_text: str
+    ) -> tuple[list[BaseTool], str]:
+        """路由函数用的轻量接口：只返回 (scoped_tools, label)，契约缓存复用。"""
+        _decision, _contract, scoped, label = _turn_contract(thread_id, user_text)
+        return scoped, label
+
+    def _reset_turn_scope(thread_id: str) -> None:
+        with _router_lock:
+            _turn_scopes.pop(thread_id, None)
+        # 新用户回合重新读取画像：save_user_profile 的写入立即对下一回合生效
+        try:
+            for record in memory_store.all_records():
+                if record.record_id.startswith("profile."):
+                    memory_store.forget(record.record_id)
+            ProfileCompatProvider(os.path.join(MEMORY_DIR, "user_profile.md")).load_into(
+                memory_store
+            )
+        except Exception:  # noqa: BLE001 - 记忆刷新失败不阻断任务
+            pass
 
     # LangGraph 的固定边不会经过路由函数，单独维护每个会话的上一节点，
     # 让审计日志可以完整还原 START、条件分支、固定边和 END。
@@ -605,7 +844,63 @@ def create_agent_app(
                     update={"tool_calls": normalized_calls})
             elif changed:
                 last.tool_calls = normalized_calls
-        return tool_node.invoke({"messages": messages})
+
+        # ---------- Execution Gateway：执行前机械校验 ----------
+        thread_id = _thread_id(config)
+        last_for_gate = messages[-1] if messages else None
+        gate_calls = getattr(last_for_gate, "tool_calls", None) or []
+        user_text = ""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                user_text = str(message.content)
+                break
+        gateway = _gateway_for(thread_id, user_text)
+        kept_calls: list[dict] = []
+        rejected_messages: list[ToolMessage] = []
+        for call in gate_calls:
+            verdict = gateway.validate(str(call.get("name", "")), call.get("args") or {})
+            audit_logger.log_event(
+                thread_id=thread_id,
+                event="gateway_check",
+                tool=str(call.get("name", "")),
+                status=verdict.status.value,
+                detail=verdict.detail[:200],
+            )
+            if verdict.ok:
+                kept_calls.append(call)
+            else:
+                rejected_messages.append(
+                    ToolMessage(
+                        content=verdict.to_tool_message_content(),
+                        tool_call_id=str(call.get("id", "")),
+                        name=str(call.get("name", "")),
+                    )
+                )
+        if not kept_calls:
+            # 全部调用被网关拒绝：不执行任何工具，直接返回结构化失败
+            return {"messages": rejected_messages}
+        if len(kept_calls) != len(gate_calls):
+            last_msg = messages[-1]
+            trimmed = last_msg.model_copy(update={"tool_calls": kept_calls})
+            messages[-1] = trimmed
+
+        result_state = tool_node.invoke({"messages": messages})
+        # 熔断回报：执行失败计入连续失败，成功复位
+        produced = result_state.get("messages", []) if isinstance(result_state, dict) else []
+        existing_ids = {str(getattr(m, "id", "")) for m in messages}
+        for message in produced:
+            if getattr(message, "type", None) != "tool":
+                continue
+            content_head = str(message.content)[:1]
+            failed = content_head in {"❌", "{"} and any_tool_failure(
+                [str(message.content)]
+            )
+            gateway.record_execution(
+                str(message.name), success=not failed
+            )
+        if rejected_messages:
+            result_state["messages"] = list(produced) + rejected_messages
+        return result_state
 
     def approval_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
         """标记审批闸门；真正的暂停由 interrupt_before=approval 完成。"""
@@ -631,6 +926,7 @@ def create_agent_app(
         messages = state.get("messages") or []
         if not messages or not isinstance(messages[-1], HumanMessage):
             return {}
+        _reset_turn_scope(_thread_id(config))
         return {
             "current_task": "",
             "task_plan": [],
@@ -692,17 +988,24 @@ def create_agent_app(
             (m for m in reversed(raw_messages) if isinstance(m, HumanMessage)),
             None,
         )  # 获取最近的用户消息,避免工具调用或AI消息干扰
-        scoped_tools, scope_label = _tool_scope_for_turn(
-            str(last_human.content) if last_human else "", actual_tools
+        user_text = str(last_human.content) if last_human else ""
+        decision, turn_contract, scoped_tools, scope_label = _turn_contract(
+            thread_id, user_text
         )
         route_observation = _route_observation(
-            str(last_human.content) if last_human else "", actual_tools, scoped_tools
+            user_text, actual_tools, scoped_tools
         )
         audit_logger.log_event(
             thread_id=thread_id,
             event="tool_route_decision",
             explicit=bool(scope_label),
             scope_label=scope_label,
+            route=decision.route,
+            intent=decision.intent,
+            capability_ids=list(decision.capability_ids),
+            allowed_tools=list(decision.allowed_tool_ids),
+            registry_version=decision.registry_version,
+            reason=decision.reason[:200],
             **route_observation,
         )
         if raw_messages:
@@ -804,34 +1107,62 @@ def create_agent_app(
         else:
             active_summary = current_summary
 
-        # 读取用户画像（user_profile.md），如果不存在则默认 "none"，所有会话共享、长期存在、低频修改
-        profile_path = os.path.join(MEMORY_DIR, "user_profile.md")
-        profile_content = "none"
-        if os.path.exists(profile_path):
-            try:
-                with open(profile_path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read().strip()
-                    if content:
-                        profile_content = content
-            except OSError:
-                pass
+        # ---------- Context Compiler：选择性记忆 + 契约化系统提示 ----------
+        # 用户画像不再整文件注入；按当前 intent/capability scope 检索相关记忆。
+        skill_context = ""
+        for capability_id in decision.capability_ids:
+            capability = capability_registry.snapshot().get(capability_id)
+            if (
+                capability is not None
+                and capability.kind == "prompt_skill"
+                and capability.context_provider is not None
+            ):
+                try:
+                    skill_context = str(capability.context_provider())
+                except Exception as exc:  # noqa: BLE001 - 上下文失败降级为空
+                    skill_context = f"[skill 上下文不可用: {exc}]"
+                break
+        failure_class = str(state.get("last_failure_class") or "")
+        failure_note = str(state.get("last_failure_note") or "")
+        failure_facts: tuple[str, ...] = ()
+        if failure_class in {"policy", "permanent", "budget"} and failure_note:
+            failure_facts = (
+                f"上一轮失败（{failure_class}）：{failure_note}。同类失败禁止重试。",
+            )
+        compiled = context_compiler.compile(
+            CompilationContext(
+                user_text=user_text,
+                route=decision.route,
+                intent=decision.intent,
+                capability_ids=decision.capability_ids,
+                memory_scopes=decision.memory_scopes,
+                history_digest=active_summary or "",
+                failure_facts=failure_facts,
+                skill_context=skill_context,
+            )
+        )
+        audit_logger.log_event(
+            thread_id=thread_id,
+            event="context_compiled",
+            route=decision.route,
+            memory_records=[m.record_id for m in compiled.memory],
+            memory_reasons={m.record_id: m.reason for m in compiled.memory},
+            estimated_tokens=compiled.estimated_tokens,
+            truncated=list(compiled.truncated_sections),
+        )
 
-        # 构建系统提示，包含角色设定是fluxagent、用户画像（从user_profile.md读取）、摘要、当前任务、计划步骤、上次失败信息
-        sys_prompt = (
-            "你是FluxAgent——一个透明且可控制的本地智能体。\n"
-            "Rules:\n"
-            "1. Stay inside the office sandbox for files/shell.\n"
-            "2. For unfamiliar skills: mode=help first, then mode=run.\n"
-            "3. When user states long-term preferences, call save_user_profile.\n"
-            "4. Installed MCP tools use names beginning with mcp_. Prefer a matching MCP tool for capabilities not covered by built-ins. "
+        sys_prompt = compiled.system_prompt
+        sys_prompt += (
+            "\n\n[Agent rules]\n"
+            "1. For unfamiliar executable skills: mode=help first, then mode=run.\n"
+            "2. When user states long-term preferences, call save_user_profile.\n"
+            "3. Installed MCP tools use names beginning with mcp_. Prefer a matching MCP tool for capabilities not covered by built-ins. "
             "After installing a new MCP server, tell the user that FluxAgent must restart to discover it.\n"
-            "5. To install an MCP, call install_mcp_server with complete arguments. The installer synchronously downloads/copies and registers the source only;"
+            "4. To install an MCP, call install_mcp_server with complete arguments. The installer synchronously downloads/copies and registers the source only;"
             " it automatically detects Node/Python, prepares dependencies, builds, and "
             "health-checks before registry commit; it runs synchronously, not in the background.\n"
-            "6. Never claim background progress, monitoring, time estimates, completion, or a tool call unless structured tool_calls and ToolMessage results exist.\n"
-            "7. Never claim a file was created, written, saved, deleted, or a tool was called unless the corresponding structured tool_call and ToolMessage result are present"
-            "8. User profile:\n"
-            f"{profile_content}\n"
+            "5. Never claim background progress, monitoring, time estimates, completion, or a tool call unless structured tool_calls and ToolMessage results exist.\n"
+            "6. Never claim a file was created, written, saved, deleted, or a tool was called unless the corresponding structured tool_call and ToolMessage result are present\n"
         )
         if enable_subagents:
             sys_prompt += (
@@ -850,9 +1181,7 @@ def create_agent_app(
                 + (f"本轮只能调用以下工具：{names}。" if names else "该服务当前未加载。")
                 + "不要调用其他 MCP、Skill 或内置工具；如果指定服务不可用，直接说明原因。\n"
             )
-        if active_summary:
-            # 添加最近的上下文摘要
-            sys_prompt += f"\n\n[Recent context]\n{active_summary}\n"
+        # [Recent context] 已由 Context Compiler 注入（history_digest），此处不再重复。
 
         if state.get("last_failure_class") == "model_protocol":
             sys_prompt += (
@@ -1228,9 +1557,10 @@ def create_agent_app(
                 ),
                 None,
             )
-            routed_tools, routed_label = _tool_scope_for_turn(
-                str(last_human.content) if last_human else "", actual_tools
-            )  # 获取当前用户请求中允许的工具列表和标签
+            _d, _c, routed_tools, routed_label = _turn_contract(
+                thread_id,
+                str(last_human.content) if last_human else "",
+            )  # 当前用户回合的允许工具列表（缓存复用，不重复路由）
             allowed_names = {str(tool.name) for tool in routed_tools}
             if str(last_tool.name) not in allowed_names:
                 # 记录工具选择不匹配的事件，帮助审计和调试
@@ -1406,8 +1736,9 @@ def create_agent_app(
             (m for m in reversed(state.get("messages") or []) if isinstance(m, HumanMessage)),
             None,
         )
-        scoped_tools, scope_label = _tool_scope_for_turn(
-            str(last_human.content) if last_human else "", actual_tools
+        scoped_tools, scope_label = _turn_contract_cached_tools(
+            thread_id,
+            str(last_human.content) if last_human else "",
         )
         allowed_names = {str(tool.name) for tool in scoped_tools}
         if any(tc.get("name") not in allowed_names for tc in tool_calls):
@@ -1489,12 +1820,14 @@ def create_agent_app(
             return target
         last_msg = state["messages"][-1]
         tool_calls = getattr(last_msg, "tool_calls", []) or []
+        thread_id = _thread_id(config)
         last_human = next(
             (m for m in reversed(state.get("messages") or []) if isinstance(m, HumanMessage)),
             None,
         )
-        scoped_tools, scope_label = _tool_scope_for_turn(
-            str(last_human.content) if last_human else "", actual_tools
+        scoped_tools, scope_label = _turn_contract_cached_tools(
+            thread_id,
+            str(last_human.content) if last_human else "",
         )
         allowed_names = {str(tool.name) for tool in scoped_tools}
         if any(tc.get("name") not in allowed_names for tc in tool_calls):

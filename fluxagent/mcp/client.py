@@ -39,6 +39,18 @@ class MCPToolLoadResult:
     tools: list[BaseTool]
     risk_overrides: dict[str, RiskLevel]
     errors: list[str]
+    # 与 tools 同批发现产生的统一能力描述（capability registry 用）
+    descriptors: list[Any]
+
+
+def _make_descriptors(record: dict[str, Any], remote_tools: list[Any], tools_by_name: dict[str, BaseTool]) -> Any:
+    """由单个 server 的 record + 发现结果生成绑定工具的统一 CapabilityDescriptor。"""
+    from ..capability.providers import bind_operation_tools, mcp_descriptors
+
+    candidates = mcp_descriptors([(record, remote_tools)])
+    if not candidates:
+        return None
+    return bind_operation_tools(candidates[0], tools_by_name)
 
 
 def _exposed_name(server_name: str, tool_name: str) -> str:
@@ -177,11 +189,12 @@ async def load_installed_mcp_tools(
     # 寻找已启用的注册服务器，而不会导致启动失败封闭。
     tools: list[BaseTool] = []
     risk_overrides: dict[str, RiskLevel] = {}
+    descriptors: list[Any] = []
     errors: list[str] = []
     try:
         records = list_installed_mcp_servers(index_path or Path(MCP_SERVERS_INDEX))
     except InstallError as exc:
-        return MCPToolLoadResult([], {}, [str(exc)])
+        return MCPToolLoadResult([], {}, [str(exc)], [])
 
     # 遍历所有已安装的 MCP 服务器记录，尝试发现工具并加载到 FluxAgent 中。
     used_names: set[str] = set()
@@ -193,17 +206,22 @@ async def load_installed_mcp_tools(
             remote_tools = await asyncio.wait_for(
                 _discover_server(record), timeout=discovery_timeout
             )
+            server_tools_by_name: dict[str, BaseTool] = {}
             for remote_tool in remote_tools:
                 exposed = _exposed_name(server_name, str(remote_tool.name))
                 if exposed in used_names:
                     raise ValueError(f"工具名称冲突: {exposed}")  # 如果工具名称冲突，抛出异常以避免覆盖。
                 used_names.add(exposed)
-                tools.append(_make_tool(record, remote_tool, exposed))  # 创建本地工具实例并添加到列表中。
+                server_tools_by_name[exposed] = _make_tool(record, remote_tool, exposed)
                 risk_overrides[exposed] = (
                     RiskLevel.READ
                     if _is_declared_read_only(record, remote_tool)
                     else RiskLevel.WRITE
                 )  # 根据 MCP 服务器的声明设置工具的风险级别。
+            tools.extend(server_tools_by_name.values())
+            descriptor = _make_descriptors(record, remote_tools, server_tools_by_name)
+            if descriptor is not None:
+                descriptors.append(descriptor)
             audit_logger.log_event(
                 thread_id="system_default",
                 event="system_action",
@@ -223,4 +241,4 @@ async def load_installed_mcp_tools(
                 error=detail[:300],
             )
 
-    return MCPToolLoadResult(tools, risk_overrides, errors)
+    return MCPToolLoadResult(tools, risk_overrides, errors, descriptors)

@@ -43,6 +43,8 @@ _POLICY_MARKERS = (
     "策略拒绝",
     "hard_deny",
     "policy_deny",
+    "route_mismatch",
+    "stale_contract",
     "Path traversal",
     "PermissionError",
 )
@@ -71,6 +73,7 @@ _PERMANENT_MARKERS = (
     "invalid argument",
     "missing required",
     "缺少必要参数",
+    "schema_error",
 )
 
 

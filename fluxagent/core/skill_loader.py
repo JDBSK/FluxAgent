@@ -432,6 +432,16 @@ def load_dynamic_skills(force_rescan: bool = False) -> List[StructuredTool]:
     return _lazy_loader.get_all_tools(force_rescan=force_rescan)
 
 
+def scan_skill_infos(force_rescan: bool = False) -> List[Dict[str, Any]]:
+    """扫描技能元数据（不构造工具）；供统一 Capability Registry 适配使用。"""
+    return _lazy_loader._scan_skills(force_rescan=force_rescan)
+
+
+def read_skill_manual(md_path: str) -> str:
+    """读取技能说明快照内容（带路径边界与大小校验）；Prompt Skill 上下文来源。"""
+    return _lazy_loader._snapshot(md_path)[2]
+
+
 def reload_skills() -> List[StructuredTool]:
     """清缓存撤销凭据并强制重扫；既有图需要重新绑定工具。"""
     _lazy_loader.clear_cache()

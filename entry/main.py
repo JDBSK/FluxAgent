@@ -149,14 +149,56 @@ async def async_main():
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as memory:
         permission_manager = PermissionManager()
         mcp_result = await load_installed_mcp_tools()
-        actual_tools = list(BUILTIN_TOOLS) + load_dynamic_skills() + mcp_result.tools
+
+        # ---------- 统一能力注册表：builtin + skill + mcp 全部走同一协议 ----------
+        from fluxagent.capability.providers import (
+            builtin_descriptors,
+            skill_descriptors,
+        )
+        from fluxagent.capability.registry import CapabilityRegistry, RegistryError
+        from fluxagent.core.skill_loader import read_skill_manual, scan_skill_infos
+        from fluxagent.core.logger import audit_logger
+
+        capability_registry = CapabilityRegistry()
+
+        def _register(descriptor):
+            try:
+                capability_registry.register(descriptor)
+                return True
+            except RegistryError as exc:
+                # fail-closed：坏描述的能力不进入系统，但不阻断启动
+                audit_logger.log_event(
+                    thread_id="system_default",
+                    event="system_action",
+                    action="capability_register_failed",
+                    capability=descriptor.capability_id,
+                    error=str(exc)[:200],
+                )
+                return False
+
+        for descriptor in builtin_descriptors(BUILTIN_TOOLS):
+            _register(descriptor)
+
+        skill_tools_by_name = {str(tool.name): tool for tool in load_dynamic_skills()}
+        for info in scan_skill_infos():
+            descriptors = skill_descriptors(
+                [info],
+                content_loader=read_skill_manual,
+                tool_loader=lambda item: skill_tools_by_name.get(str(item.get("name") or "")),
+            )
+            for descriptor in descriptors:
+                _register(descriptor)
+
+        for descriptor in getattr(mcp_result, "descriptors", []):
+            _register(descriptor)
+
         policy = build_policy_config(tool_base_overrides=mcp_result.risk_overrides)
         app = create_agent_app(
             provider_name=current_provider,
             model_name=current_model,
             checkpointer=memory,
             permission_manager=permission_manager,
-            tools=actual_tools,
+            capability_registry=capability_registry,
             policy=policy,
         )
         session_store = SessionStore()
