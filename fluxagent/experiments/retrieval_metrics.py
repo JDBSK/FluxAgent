@@ -165,6 +165,9 @@ LABELED_QUERIES: list[tuple[str, str]] = [
     ("帮我写一首关于春天的诗", "none"),
     ("你觉得人生的意义是什么", "none"),
     ("讲个笑话听听", "none"),
+    # 域名词提及但不需要执行（应 abstain——提及 != 请求）
+    ("股票被套了很难受，先安慰我一下", "none"),
+    ("明天讲课要举天气的例子，帮我想两个", "none"),
 ]
 
 
@@ -276,7 +279,8 @@ def evaluate_scale(scale_num: int) -> dict[str, Any]:
     discrimination_correct = 0
     discrimination_total = 0
     for domain, siblings in domain_groups.items():
-        domain_index = _SCALE_DOMAIN_WORDS.index(domain)
+        # capability_id 形如 cap.gen{d:02d}.{i:02d}，从 id 恢复域序号
+        domain_index = int(domain[3:5])
         for item in range(max(1, len(siblings) // 2)):
             action = _SCALE_ACTION_WORDS[(domain_index + item) % len(_SCALE_ACTION_WORDS)]
             filler = _SCALE_FILLER[(domain_index * 3 + item) % len(_SCALE_FILLER)]

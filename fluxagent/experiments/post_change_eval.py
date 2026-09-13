@@ -168,6 +168,7 @@ def build_synthetic_registry() -> tuple[CapabilityRegistry, dict[str, Any]]:
             "mcp_cooking_recommendMeals",
             CookingArgs,
             lambda: _recorder("mcp_cooking_recommendMeals"),
+            (),
         ),
         (
             "mcp.market",
@@ -178,6 +179,7 @@ def build_synthetic_registry() -> tuple[CapabilityRegistry, dict[str, Any]]:
             "mcp_market_getQuotes",
             MarketArgs,
             lambda: _strict_market,
+            ("比特币", "加密货币", "黄金"),
         ),
         (
             "mcp.weather",
@@ -188,6 +190,7 @@ def build_synthetic_registry() -> tuple[CapabilityRegistry, dict[str, Any]]:
             "mcp_weather_getWeather",
             WeatherArgs,
             lambda: _recorder("mcp_weather_getWeather"),
+            (),
         ),
         (
             "mcp.translate",
@@ -198,9 +201,10 @@ def build_synthetic_registry() -> tuple[CapabilityRegistry, dict[str, Any]]:
             "mcp_translate_text",
             TranslateArgs,
             lambda: _recorder("mcp_translate_text"),
+            (),
         ),
     ]
-    for capability_id, name, description, intents, examples, tool_name, args_model, fn_builder in specs:
+    for capability_id, name, description, intents, examples, tool_name, args_model, fn_builder, negatives in specs:
         tool = StructuredTool.from_function(
             func=fn_builder(), name=tool_name, description=description,
             args_schema=args_model,
@@ -215,6 +219,7 @@ def build_synthetic_registry() -> tuple[CapabilityRegistry, dict[str, Any]]:
                 aliases=(name,),
                 intents=intents,
                 examples=examples,
+                negative_examples=negatives,
                 operations=(
                     _op(capability_id, tool_name, description, schema_of_model(args_model), tool),
                 ),
@@ -621,6 +626,10 @@ def main() -> int:
         "--real-embedding", action="store_true",
         help="检索指标尝试真实 embedding 服务（需 FLUXAGENT_EMBEDDING_* 配置且渠道支持）",
     )
+    parser.add_argument(
+        "--scale-sweep", action="store_true",
+        help="附加任意能力集规模扫描（20/50/100）",
+    )
     args = parser.parse_args()
 
     from dotenv import load_dotenv
@@ -665,13 +674,16 @@ def main() -> int:
     # 检索质量指标：标注语料上的 recall@k / MRR / 路由决策正确率（0 API，
     # 真实 embedding 仅在显式传入 --real-embedding 且服务可用时附加）
     try:
-        from .retrieval_metrics import run_metrics as _run_retrieval_metrics
+        from .retrieval_metrics import run_metrics as _run_retrieval_metrics, run_scale_sweep
 
+        d_report = _run_retrieval_metrics(
+            include_real_embedding=bool(args.real_embedding)
+        )
+        if args.scale_sweep:
+            d_report["scale_sweep"] = run_scale_sweep((20, 50, 100))
         report["tracks"]["D_retrieval_metrics"] = {
             "kind": "deterministic",
-            "report": _run_retrieval_metrics(
-                include_real_embedding=bool(args.real_embedding)
-            ),
+            "report": d_report,
         }
     except Exception as exc:  # noqa: BLE001 - 指标失败不掩盖主报告
         report["tracks"]["D_retrieval_metrics"] = {"kind": "error", "error": str(exc)[:300]}

@@ -1,6 +1,6 @@
 # 统一能力路由与 Context Compiler 实现总结
 
-日期：2026-09-13 08:03 UTC ｜ 分支：`feature/capability-routing-context`（基线 `11f0aa5`）
+日期：2026-09-13 13:00 UTC ｜ 分支：`feature/capability-routing-context`（基线 `11f0aa5`）
 
 ## 1. 解决的问题
 
