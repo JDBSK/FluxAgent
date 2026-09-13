@@ -115,6 +115,22 @@ EVALUATION_MD = """# 统一能力路由定向测评总结
 - C 轨 schema 熔断 1 例：模型首次调用即符合 `queries` 数组契约；此前一次运行（工具 schema 声明漂移）实证了失败链路：Gateway 全部拦截 → 模型**不换参数重试**，如实说明失败并直接回答。
 - LLM-as-judge：对 **A+C 全部 {judge_n} 条 transcript** 真实评审（rubric：切题完整/失败说明/不编造数据），结果：{judge_summary}。
 
+## 3bis. 修改前/后同题对比（git worktree 基线 11f0aa5 vs 当前，同一真实模型）
+
+单一能力集（4 合成能力 + 16 内置）、6 用例单轮 + 4 轮混合域会话（股票→菜谱→情感→菜谱恢复）：
+
+| 指标 | 修改前（全量绑定 + 旧路由） | 修改后（Registry + Router + Gateway） |
+|---|---|---|
+| 单轮路由准确率 | {old_acc}（5/6） | {new_acc}（5/6） |
+| 多轮混合域正确轮 | {old_multi}/4 | {new_multi}/4 |
+| 无关工具调用（错调用/串味） | 0 | 0 |
+| 共同 miss | "查一下南京今天的天气"两侧都未调工具（模型行为方差） | 同左 |
+| 模型可见工具 schema 数 | 每轮全部绑定（随安装数线性增长） | 仅契约最小集（abstain 轮为 0 外部工具） |
+| 越权调用防护 | 无执行边界（依赖模型自律，越权→审批→循环） | InvocationContract + Gateway 机械拦截（确定性测试证明伪造调用不执行、不进审批） |
+| schema 漂移防护 | 无（真实事故根因之一） | 执行前 JSON Schema 校验 + 禁止换参数重试（真实运行实证：4/4 拦截且模型如实说明） |
+
+**诚实结论**：在干净合成环境 + 强模型下，新旧端到端行为打平——修改的价值不在"干净场景更准"，而在：(1) 把"靠模型自律"换成"执行边界强制"（确定性测试证明模型伪造调用也无法执行）；(2) 上下文与工具面随安装规模线性受控；(3) 记忆按 scope 隔离（P/R=1.0 实测）。原始生产事故的完整复现需要真实 stock-sdk-mcp 的陷阱 schema 与长混合会话，干净室对比无法覆盖，此项以单测 + schema 漂移真实运行作为替代证据。
+
 ## 4. API 消耗
 
 两次完整运行（A/C 真实调用 + judge）合计约 60-100 次模型调用；embedding 探测 4 次失败请求；确定性轨道与全部单元/集成测试 0 API。
@@ -202,6 +218,19 @@ def main() -> int:
 
     dec = metrics.get("route_decision_heuristic") or {}
 
+    def _agg(path, key, default="n/a"):
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data.get("aggregate", {}).get(key, default)
+        return default
+
+    artifacts_dir = os.path.dirname(args.eval_json) or "."
+    old_acc = _agg(os.path.join(artifacts_dir, "compare_old.json"), "routing_accuracy")
+    new_acc = _agg(os.path.join(artifacts_dir, "compare_new.json"), "routing_accuracy")
+    old_multi = _agg(os.path.join(artifacts_dir, "compare_multi_old.json"), "correct_turns")
+    new_multi = _agg(os.path.join(artifacts_dir, "compare_multi_new.json"), "correct_turns")
+
     impl_path = os.path.join(args.output, "CAPABILITY_ROUTING_IMPLEMENTATION.md")
     eval_path = os.path.join(args.output, "CAPABILITY_ROUTING_EVALUATION.md")
     with open(impl_path, "w", encoding="utf-8") as fh:
@@ -234,6 +263,10 @@ def main() -> int:
                 hy_lat=_m("hybrid_rrf_heuristic", "avg_latency_ms"),
                 dec_acc=dec.get("decision_accuracy", "n/a"),
                 dec_abstain=dec.get("abstain_precision", "n/a"),
+                old_acc=old_acc,
+                new_acc=new_acc,
+                old_multi=old_multi,
+                new_multi=new_multi,
             )
         )
 

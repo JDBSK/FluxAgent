@@ -54,3 +54,7 @@ _run_full_eval.cmd
 _tmp_*.cmd
 artifacts/
 _tmp_*.py
+
+# baseline worktree for before/after comparison
+.baseline-wt/
+_compare_runner.py
