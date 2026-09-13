@@ -30,9 +30,10 @@ from .retrieval import (
 
 ROUTE_DECISIONS = frozenset({"route", "answer_without_tools", "clarify", "unavailable"})
 
-# 索引构建逻辑版本：语料选择规则变化（如 v2 排除 builtin）时递增，
+# 索引构建逻辑版本：语料选择规则或索引头语义变化（如 v3 头部改记
+# content_version——索引只随内容失效，不随健康翻转重建）时递增，
 # 使旧持久化索引整体失效——否则代码升级后仍会加载带旧语料的索引。
-INDEX_FORMAT_VERSION = "2"
+INDEX_FORMAT_VERSION = "3"
 
 _STOPWORDS = frozenset({
     "the", "and", "for", "with", "please", "help", "me", "my", "a", "an", "to",
@@ -374,7 +375,9 @@ class HybridRouter:
             self._bm25 = new_bm25
             self._dense = new_dense
             self._docs_by_id = mapping
-            self._index_registry_version = snapshot.version
+            # 索引只随内容失效：健康翻转推进 snapshot.version（契约/网关语义）
+            # 但不推进 content_version，此处记录内容版本
+            self._index_registry_version = snapshot.content_version
 
     @property
     def index_version(self) -> str:
@@ -394,7 +397,7 @@ class HybridRouter:
         with self._index_lock:
             header = {
                 "format": INDEX_FORMAT_VERSION,
-                "registry_version": self._index_registry_version,
+                "content_version": self._index_registry_version,
                 "embedding_tag": self.embedding_provider.model_tag,
             }
             self._bm25.save(os.path.join(directory, "bm25.json"), header)
@@ -412,11 +415,11 @@ class HybridRouter:
                 )
 
     def load_index(self, directory: str, snapshot: RegistrySnapshot) -> bool:
-        """尝试加载与当前 registry 版本和 embedding tag 匹配的持久化索引。
+        """尝试加载与当前 registry 内容版本和 embedding tag 匹配的持久化索引。
 
-        成功返回 True（不再重建）；索引格式版本、registry 版本、embedding tag
+        成功返回 True（不再重建）；索引格式版本、内容版本、embedding tag
         任一不匹配或文件损坏时返回 False（调用方必须 rebuild），绝不允许旧
-        索引配新代码/新注册表。
+        索引配新代码/新注册表。健康翻转不改变内容版本，因此不会导致重建。
         """
         import json
         import os
@@ -429,7 +432,7 @@ class HybridRouter:
             return False
         if meta.get("format") != INDEX_FORMAT_VERSION:
             return False
-        if meta.get("registry_version") != snapshot.version:
+        if meta.get("content_version") != snapshot.content_version:
             return False
         if meta.get("embedding_tag") != self.embedding_provider.model_tag:
             return False
@@ -439,7 +442,7 @@ class HybridRouter:
             # 逐文件校验头：防止多进程交错写出的"meta 新 + 数据旧"组合
             for payload_header in (bm25._header, dense._header):
                 if payload_header.get("format") != INDEX_FORMAT_VERSION \
-                        or payload_header.get("registry_version") != snapshot.version \
+                        or payload_header.get("content_version") != snapshot.content_version \
                         or payload_header.get("embedding_tag") != self.embedding_provider.model_tag:
                     return False
         except (OSError, ValueError, KeyError, AttributeError):
@@ -447,7 +450,7 @@ class HybridRouter:
         with self._index_lock:
             self._bm25 = bm25
             self._dense = dense
-            self._index_registry_version = snapshot.version
+            self._index_registry_version = snapshot.content_version
             # doc_id -> descriptor 映射从 snapshot 重建（与 rebuild 的语料选择
             # 规则一致：排除 builtin；描述可内存推导，无需持久化）
             mapping: Dict[str, Tuple[CapabilityDescriptor, Optional[OperationDescriptor]]] = {}
@@ -471,7 +474,8 @@ class HybridRouter:
         context_turns: Optional[Sequence[str]] = None,
     ) -> RouteDecision:
         text = str(user_text or "").strip()
-        if self._index_registry_version != snapshot.version:
+        # 索引失效只看内容版本：健康翻转走契约/Gateway 失效路径，不重建索引
+        if self._index_registry_version != snapshot.content_version:
             try:
                 self.rebuild_index(snapshot)
             except EmbeddingError as exc:

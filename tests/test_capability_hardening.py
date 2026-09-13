@@ -113,6 +113,45 @@ class TestIndexPersistence(unittest.TestCase):
             router2 = HybridRouter(embedding_provider=DeterministicEmbedding(dim=64))
             self.assertFalse(router2.load_index(tmp, snapshot))
 
+    def test_health_flap_does_not_trigger_index_rebuild(self):
+        """健康翻转推进 snapshot.version（契约/网关失效）但 content_version
+        不变：decide() 不得重建检索索引；内容变化（新能力注册）仍触发。"""
+        from fluxagent.capability.descriptors import ProviderHealth
+
+        registry = CapabilityRegistry()
+        registry.register(make_capability("cap.alpha", name="AlphaSvc", description="菜谱推荐服务"))
+        snapshot = registry.snapshot()
+        router = HybridRouter(embedding_provider=DeterministicEmbedding(dim=128))
+        router.decide("推荐菜谱", snapshot)  # 首次 decide 完成索引构建
+
+        rebuild_calls: list[str] = []
+        original_rebuild = router.rebuild_index
+
+        def counting_rebuild(snap):
+            rebuild_calls.append(snap.content_version)
+            return original_rebuild(snap)
+
+        router.rebuild_index = counting_rebuild
+
+        # 健康翻转（含转为不可用/恢复）：version 推进，但索引不重建
+        v_healthy = registry.snapshot().version
+        registry.update_health("cap.alpha", ProviderHealth.UNAVAILABLE)
+        self.assertNotEqual(v_healthy, registry.snapshot().version)
+        decision = router.decide(
+            "推荐菜谱", registry.snapshot(), explicit_capability="cap.alpha"
+        )
+        self.assertEqual(decision.route, "unavailable")
+        registry.update_health("cap.alpha", ProviderHealth.HEALTHY)
+        router.decide("推荐菜谱", registry.snapshot())
+        self.assertEqual(rebuild_calls, [])
+
+        # 内容变化：新能力注册必须触发重建（索引语料随之更新）
+        registry.register(
+            make_capability("cap.new", name="NewSvc", description="翻译文本服务")
+        )
+        router.decide("翻译文本", registry.snapshot())
+        self.assertEqual(len(rebuild_calls), 1)
+
 
 class TestHeuristicRerankerOrders(unittest.TestCase):
     def test_retrieval_order_preserves_fused_rank(self):

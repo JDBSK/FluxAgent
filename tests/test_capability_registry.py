@@ -116,6 +116,31 @@ class TestRegistryContract(unittest.TestCase):
         # 内容不变则版本稳定
         self.assertEqual(snapshot2.version, registry.snapshot().version)
 
+    def test_health_flap_advances_version_not_content_version(self):
+        """version（契约/网关失效 key）随健康推进；content_version（索引
+        失效 key）只随内容推进——健康翻转不得触发检索索引重建。"""
+        registry = CapabilityRegistry()
+        registry.register(make_capability())
+        snap1 = registry.snapshot()
+        registry.update_health("cap.alpha", ProviderHealth.DEGRADED)
+        snap2 = registry.snapshot()
+        self.assertNotEqual(snap1.version, snap2.version)
+        self.assertEqual(snap1.content_version, snap2.content_version)
+        registry.update_health("cap.alpha", ProviderHealth.HEALTHY)
+        self.assertEqual(
+            snap1.content_version, registry.snapshot().content_version
+        )
+
+    def test_enable_toggle_changes_content_version(self):
+        """enabled 影响语料选择（禁用能力不进索引），必须推进 content_version。"""
+        registry = CapabilityRegistry()
+        registry.register(make_capability())
+        snap1 = registry.snapshot()
+        registry.set_enabled("cap.alpha", False)
+        snap2 = registry.snapshot()
+        self.assertNotEqual(snap1.version, snap2.version)
+        self.assertNotEqual(snap1.content_version, snap2.content_version)
+
     def test_duplicate_capability_id_fails_closed(self):
         registry = CapabilityRegistry()
         registry.register(make_capability())

@@ -36,10 +36,19 @@ def validate_operation_schema(schema: Mapping[str, Any]) -> None:
 
 @dataclass(frozen=True)
 class RegistrySnapshot:
-    """不可变注册表视图：Router/Compiler/Gateway 的统一输入。"""
+    """不可变注册表视图：Router/Compiler/Gateway 的统一输入。
+
+    version 与 content_version 的分工：
+    - version（含健康+启用）：契约与网关的失效 key——能力运行中转为
+      UNAVAILABLE 时，旧契约必须被 Gateway 拒绝并强制重路由（安全属性）；
+    - content_version（仅内容+启用）：检索索引的失效 key——语料与语料
+      选择不随健康变化，健康翻转不应触发（可能含远程 embedding 的）
+      全量索引重建；运行时 reranker/Gateway 已按健康过滤。
+    """
 
     version: str
     capabilities: Tuple[CapabilityDescriptor, ...]
+    content_version: str = ""
 
     def get(self, capability_id: str) -> Optional[CapabilityDescriptor]:
         for capability in self.capabilities:
@@ -171,7 +180,10 @@ class CapabilityRegistry:
                 sorted(self._capabilities.values(), key=lambda c: c.capability_id)
             )
         version = _snapshot_version(capabilities)
-        return RegistrySnapshot(version=version, capabilities=capabilities)
+        content_version = _content_version(capabilities)
+        return RegistrySnapshot(
+            version=version, capabilities=capabilities, content_version=content_version
+        )
 
     # ---------- 内部 ----------
 
@@ -242,6 +254,16 @@ def build_registry_snapshot(registry: CapabilityRegistry) -> RegistrySnapshot:
 def _snapshot_version(capabilities) -> str:
     payload = json.dumps(
         [[c.content_fingerprint(), c.provider_health.value, c.enabled] for c in capabilities],
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+# 索引失效 key：仅内容（指纹 + enabled）。健康是运行时状态，不改变语料——
+# 健康翻转推进 version（契约失效）但不推进 content_version（索引不重建）。
+def _content_version(capabilities) -> str:
+    payload = json.dumps(
+        [[c.content_fingerprint(), c.enabled] for c in capabilities],
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
