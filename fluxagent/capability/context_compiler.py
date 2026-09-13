@@ -305,6 +305,7 @@ class ContextCompiler:
         token_budget: int = 2000,
         tokenizer: Optional[Callable[[str], int]] = None,
         max_skill_context_tokens: int = 600,
+        max_memory_value_chars: int = 200,
     ) -> None:
         if token_budget < 64:
             raise ValueError("token_budget 过小")
@@ -314,6 +315,7 @@ class ContextCompiler:
         self.token_budget = token_budget
         self.tokenizer = tokenizer or estimate_tokens
         self.max_skill_context_tokens = max_skill_context_tokens
+        self.max_memory_value_chars = max_memory_value_chars
 
     def compile(
         self,
@@ -337,15 +339,22 @@ class ContextCompiler:
         memory_lines: List[str] = []
         for record in records:
             reason = self._injection_reason(record, context)
+            # 注入侧截断（防御纵深）：不信任写入方的值长度，
+            # 超长内容（含可能的注入文本）在这里被截为数据摘要
+            value = (
+                record.value[: self.max_memory_value_chars] + "…[截断]"
+                if len(record.value) > self.max_memory_value_chars
+                else record.value
+            )
             memory_injected.append(
                 InjectedMemory(
                     record_id=record.record_id,
                     scope=record.scope.value,
-                    value=record.value,
+                    value=value,
                     reason=reason,
                 )
             )
-            memory_lines.append(f"- {record.value}")
+            memory_lines.append(f"- {value}")
 
         # skill 上下文按独立预算裁剪
         skill_block = ""
