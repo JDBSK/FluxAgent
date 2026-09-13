@@ -85,3 +85,44 @@
 ```cmd
 run_overnight.cmd   :: 回归 -> 能力测试 -> 定向测评（含规模扫描） -> 长会话回归 -> 真实语料冒烟 -> 总结
 ```
+
+---
+
+## 7. 收尾轮补充（2026-09-13，P0-P5 收尾计划）
+
+本轮在冻结基线之上新增四项能力/修复，全部附确定性测试与真实模型定向证据。
+
+### 7.1 新增能力与修复
+
+| 项 | 内容 | 确定性证据 |
+|---|---|---|
+| MemoryStore 持久化 | 结构化记忆（task_state/episodic）变更即原子快照、启动恢复；TTL 过期不复活、session 隔离保留、坏文件 fail-open | `tests/test_context_compiler.py::TestMemoryStorePersistence`（8 例） |
+| 索引重建修复 | 快照拆分 content_version（指纹+enabled）/ version（含健康）：健康抖动只推进契约失效，不再触发全量索引重建（接远程 embedding 时避免重建风暴） | `test_capability_registry.py` 2 例 + `test_capability_hardening.py` 健康翻转不重建（计数断言） |
+| LLM 路由重排启用 | `FLUXAGENT_ROUTER_MODEL` 走生产接线（agent.py），故障回退启发式并审计 | 既有 hardening/frontier 用例 + 本节 7.2 真实复测 |
+| 步骤级重路由 | 多步计划推进到需要契约外能力的新步骤时，用步骤文本重路由并**只增不删**扩充回合契约；以 (step_index, action) 指纹去重；abstain/未注册/不可用一律不扩权 | `test_capability_agent_integration.py::TestStepLevelReroute`（2 例：扩权成功 + 未注册不可扩权） |
+
+### 7.2 真实模型定向证据（Deepseek-v4-flash，与 SUT 同款 judge，沿用既有口径声明）
+
+**LLM 重排 vs 启发式（22 标注查询，`retrieval_metrics --llm-reranker`）**：
+
+- decision_accuracy 打平（0.8333 vs 0.8333），但错误结构改变：修复 5 例（2 例语义改写/跨语言 + 3 例"提及≠请求"边界 abstain），回退 2 例（域内近义混淆：行情 vs K线、营养双问句），judge 故障回退 0 例。
+- 结论：LLM 重排的价值在语义与边界（ abstain 判定），不在词法可达查询；二者互补，总分持平。
+
+**步骤级重路由端到端（5 场景，`step_reroute_eval`）**：
+
+- 机械 oracle 4/5：跨能力正例（能力顺序互换）、三步链（builtin 尾步不误扩权）、未注册负例（不扩权、不执行替代工具）、单能力对照全部通过。
+- 1 例 fail（cook_then_market）归因：**机制正常**（第 2 轮起绑定面已扩充、`step_reroute_expanded` 审计在案），模型重复调用首步工具后错误声称"未被授权"——属模型行为方差，judge 如实捕获。
+- judge 校准：judge-oracle 一致率 1.0，**误判通过 0**；AB 换序（证据逆序重评）方向翻转 0。
+- 部署级发现（首轮真实运行暴露）：能力卡描述为 generic 占位（"计数工具 ..."）时，步骤文本检索无证据、重路由 abstain——**语料质量是路由召回的上限**，与生产 MCP 卡描述丰富度直接相关。
+
+### 7.3 回归状态
+
+- L0：335 passed / 3 skipped / 0 failed（含本轮新增 12 例）。
+- L1：610/610（100%），0 安全失败。
+- 测试环境隔离：`tests/conftest.py` 清空 `FLUXAGENT_ROUTER_MODEL`，避免本地 .env 使装配挂上 stub 重排器、打乱 mock 序列。
+
+### 7.4 残余风险（更新）
+
+- 原"语义检索层未接入"改写为明确边界：向量半边为结构预留（`INDEX_FORMAT_VERSION=3` 语义上已只随内容失效），当前路由 = BM25 词法召回 + 覆盖度门槛 + LLM 受约束单选（可选启用）；embedding 接入后自动恢复双路 RRF，需复测。
+- 步骤级重路由的模型行为方差（未使用已授权工具、错误声称未授权）提示后续可在契约块中显式标注"本回合新增授权"，属提示工程调优，未在本轮实施。
+- 全量 L2（278 trials）未重跑；本轮为定向新增证据，不与旧基线构成 paired 比较。

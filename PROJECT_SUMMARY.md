@@ -85,3 +85,19 @@ python -m tests.eval.llmjudge.final_report                          :: 最终聚
 2. **judge 也要测**：20 条人工标注校准集，一致率 94.4%、误判通过 0；AB 换序测裁判稳定性
 3. **统计学诚实**：所有百分比附 Wilson 95% CI 与分母；invalid（用例设计缺陷）与 fail（产品失败）分开呈现，不悄悄改分母
 4. **工程化**：trial 级持久化/断点续跑/证据零丢失/多渠道容错——真实测评经历三个渠道故障全部自动恢复
+
+---
+
+## 六、收尾轮（2026-09-13）增量
+
+在第四节清单基础上新增（只增不删）：
+
+| 项 | 状态 |
+|---|---|
+| MemoryStore 持久化（重启恢复，fail-open） | ✅ L0 8 例 |
+| 快照 content_version 拆分：健康抖动不再触发索引重建 | ✅ 计数断言 |
+| LLM 路由重排（FLUXAGENT_ROUTER_MODEL）+ 真实复测 | ✅ 修复 5/回退 2，总分持平 |
+| 步骤级重路由（只增不删扩权，fail-closed） | ✅ 真实 5 场景 oracle 4/5，judge 一致率 1.0、误判通过 0、AB 翻转 0 |
+| tests/conftest.py 路由 LLM 环境隔离 | ✅ |
+
+详见 `CAPABILITY_ROUTING_EVALUATION.md` 第 7 节。无用文件待清理项已移交 `scratch/无用文件待清理.txt`。
