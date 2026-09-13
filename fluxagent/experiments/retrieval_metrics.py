@@ -8,6 +8,7 @@ Hybrid（RRF+启发式重排）——用数字回答"路由检索是否比单路
 
 用法：
   python -m fluxagent.experiments.retrieval_metrics --output artifacts
+  python -m fluxagent.experiments.retrieval_metrics --llm-reranker  # 需 FLUXAGENT_ROUTER_MODEL
 """
 from __future__ import annotations
 
@@ -382,7 +383,31 @@ def evaluate_route_decisions(decide_fn) -> dict[str, Any]:
     }
 
 
-def run_metrics(include_real_embedding: bool = False) -> dict[str, Any]:
+def _route_decisions_detailed(decide_fn, fallback_reason_fn=None) -> list[dict[str, Any]]:
+    """逐查询路由决策记录：标签、是否正确、实际路由与能力；用于两种重排器的对齐 diff。"""
+    rows: list[dict[str, Any]] = []
+    for query, label in LABELED_QUERIES:
+        decision = decide_fn(query)
+        if label == "none":
+            ok = decision.route in {"answer_without_tools", "clarify", "unavailable"}
+        else:
+            ok = decision.route == "route" and list(decision.capability_ids) == [label]
+        row: dict[str, Any] = {
+            "query": query,
+            "label": label,
+            "ok": ok,
+            "route": decision.route,
+            "capabilities": list(decision.capability_ids),
+        }
+        if fallback_reason_fn is not None:
+            row["fallback_reason"] = fallback_reason_fn()
+        rows.append(row)
+    return rows
+
+
+def run_metrics(
+    include_real_embedding: bool = False, include_llm_reranker: bool = False
+) -> dict[str, Any]:
     registry, counts = build_corpus()
     snapshot = registry.snapshot()
 
@@ -448,6 +473,66 @@ def run_metrics(include_real_embedding: bool = False) -> dict[str, Any]:
         "dense_real_embedding": None,
     }
 
+    # LLM 重排可选轨：与生产接线一致（agent.py）——FLUXAGENT_ROUTER_MODEL
+    # 优先，回落 DEFAULT_PROVIDER/DEFAULT_MODEL；LLM 故障回退同配置启发式。
+    # 度量语义改写/跨语言查询（BM25 词法 miss）能否被受约束单选补齐。
+    report["llm_reranker"] = None
+    if include_llm_reranker:
+        from fluxagent.core.config import load_dotenv  # 与主程序同源加载 .env
+
+        load_dotenv()
+        model_name = (
+            os.getenv("FLUXAGENT_ROUTER_MODEL", "").strip()
+            or os.getenv("DEFAULT_MODEL", "").strip()
+        )
+        if not model_name:
+            report["llm_reranker"] = {
+                "skipped": True,
+                "reason": "FLUXAGENT_ROUTER_MODEL / DEFAULT_MODEL 未配置",
+            }
+        else:
+            from fluxagent.capability.router import LLMReranker
+            from fluxagent.core.provider import get_provider
+
+            llm_router = HybridRouter(embedding_provider=provider)
+            llm_router.rebuild_index(snapshot)
+            llm_router.reranker = LLMReranker(
+                get_provider(
+                    provider_name=os.getenv("DEFAULT_PROVIDER", "aliyun"),
+                    model_name=model_name,
+                ),
+                fallback=llm_router.reranker,
+            )
+            llm_rows = _route_decisions_detailed(
+                lambda q: llm_router.decide(q, snapshot),
+                fallback_reason_fn=lambda: llm_router.reranker.last_fallback_reason,
+            )
+            heur_rows = _route_decisions_detailed(lambda q: router.decide(q, snapshot))
+            heur_by_query = {row["query"]: row for row in heur_rows}
+            positive_rows = [row for row in llm_rows if row["label"] != "none"]
+            report["llm_reranker"] = {
+                "model": model_name,
+                "decision_accuracy": round(
+                    sum(1 for row in positive_rows if row["ok"]) / max(1, len(positive_rows)),
+                    4,
+                ),
+                "heuristic_decision_accuracy": report["route_decision_heuristic"]["decision_accuracy"],
+                "recovered_vs_heuristic": [
+                    row["query"]
+                    for row in llm_rows
+                    if row["ok"] and not heur_by_query[row["query"]]["ok"]
+                ],
+                "regressed_vs_heuristic": [
+                    row["query"]
+                    for row in llm_rows
+                    if not row["ok"] and heur_by_query[row["query"]]["ok"]
+                ],
+                "fallback_rows": [
+                    row["query"] for row in llm_rows if row.get("fallback_reason")
+                ],
+                "detail": llm_rows,
+            }
+
     # 真实 embedding 可选轨：仅在配置了 FLUXAGENT_EMBEDDING_* 时执行
     if include_real_embedding:
         real_provider = load_embedding_provider({
@@ -479,9 +564,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="retrieval quality metrics")
     parser.add_argument("--output", default="artifacts")
     parser.add_argument("--real-embedding", action="store_true")
+    parser.add_argument(
+        "--llm-reranker",
+        action="store_true",
+        help="用受约束 LLM 重排（FLUXAGENT_ROUTER_MODEL，回落默认渠道）跑标注查询集",
+    )
     parser.add_argument("--scale-sweep", action="store_true", help="运行任意能力集规模扫描")
     args = parser.parse_args()
-    report = run_metrics(include_real_embedding=args.real_embedding)
+    report = run_metrics(
+        include_real_embedding=args.real_embedding,
+        include_llm_reranker=args.llm_reranker,
+    )
     if args.scale_sweep:
         report["scale_sweep"] = run_scale_sweep((20, 50, 100))
     os.makedirs(args.output, exist_ok=True)
@@ -502,6 +595,19 @@ def main() -> int:
             f"latency={entry['avg_decision_latency_ms']}ms "
             f"index_build={entry['index_build_seconds']}s"
         )
+    if report.get("llm_reranker"):
+        llm = report["llm_reranker"]
+        if llm.get("skipped"):
+            print(f"[llm-reranker] skipped: {llm.get('reason')}")
+        else:
+            print(
+                f"[llm-reranker] model={llm['model']} "
+                f"decision_accuracy={llm['decision_accuracy']} "
+                f"(heuristic={llm['heuristic_decision_accuracy']}) "
+                f"recovered={len(llm['recovered_vs_heuristic'])} "
+                f"regressed={len(llm['regressed_vs_heuristic'])} "
+                f"fallback_rows={len(llm['fallback_rows'])}"
+            )
     print(f"[retrieval] report -> {out_path}")
     return 0
 
