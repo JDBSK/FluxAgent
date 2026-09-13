@@ -104,17 +104,19 @@ def test_lazy_loading():
         print(f"[OK] 结果预览: {result[:100]}...")
         assert "Test Skill 0" in result, "技能内容未正确加载"
         
-        # 测试 5: 第二次调用（应该使用缓存）
-        print(f"\n[测试 1.5] 第二次调用（应该使用缓存）...")
-        start_time = time.time()
-        result2 = tools[0].func(mode='help')
-        elapsed2 = time.time() - start_time
-        print(f"[OK] 第二次调用耗时: {elapsed2:.4f}秒")
-        if elapsed2 > 0:
-            print(f"[OK] 速度提升: {(elapsed / elapsed2):.2f}x")
-        else:
-            print(f"[OK] 速度提升: 缓存响应极快 (< 0.001s)")
-        assert elapsed2 <= elapsed, "第二次调用应该更快或相等（使用缓存）"
+        # 测试 5: 第二次调用（必须命中内容缓存，不得触发磁盘重读）
+        # 注意：不用墙钟计时断言缓存——在整包回归负载下计时对比天然 flaky；
+        # 确定性等价物 = 缓存命中路径不会调用 _load_skill_content
+        print(f"\n[测试 1.5] 第二次调用（应命中内容缓存）...")
+        from unittest.mock import patch as _mock_patch
+
+        with _mock_patch.object(
+            skill_loader_module.LazySkillLoader,
+            "_load_skill_content",
+            side_effect=AssertionError("第二次调用应命中缓存，不应重新加载内容"),
+        ):
+            result2 = tools[0].func(mode='help')
+        assert result2 == result, "缓存返回内容与首次加载不一致"
         
         print("\n" + "=" * 60)
         print("测试 2: 强制重新扫描")
