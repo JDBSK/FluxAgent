@@ -879,6 +879,7 @@ def create_agent_app(
 
     def _maybe_step_reroute(
         thread_id: str,
+        user_text: str,
         state: AgentState,
         decision: RouteDecision,
         contract: InvocationContract,
@@ -919,8 +920,12 @@ def create_agent_app(
             return decision, contract, scoped_tools
 
         # 显式解析/歧义/提示词命中未注册——全部由 Router 自身的 fail-closed
-        # 语义处理（clarify/abstain → 不扩权），这里不做二次解释
-        step_decision = _router.decide(action_text, snapshot)
+        # 语义处理（clarify/abstain → 不扩权），这里不做二次解释；
+        # context_turns 供 abstain 时的会话上下文救援（planner 改写步骤文本
+        # 常丢失能力关键词，原请求文本可补足词面证据）
+        step_decision = _router.decide(
+            action_text, snapshot, context_turns=[user_text]
+        )
         new_caps = tuple(
             cap_id
             for cap_id in step_decision.capability_ids
@@ -1270,7 +1275,7 @@ def create_agent_app(
         )
         # 步骤级重路由：计划推进到需要契约外能力的新步骤时扩充授权
         decision, turn_contract, scoped_tools = _maybe_step_reroute(
-            thread_id, state, decision, turn_contract, scoped_tools, scope_label
+            thread_id, user_text, state, decision, turn_contract, scoped_tools, scope_label
         )
         route_observation = _route_observation(
             user_text, actual_tools, scoped_tools
