@@ -59,17 +59,134 @@ class MemoryRecord:
         return reference - self.created_at > self.ttl_seconds
 
 
+# 记忆持久化文件格式版本：序列化字段或语义变化时递增，旧文件整份拒绝
+# （fail-open 起步为空记忆，不会把旧结构误读进新代码）。
+MEMORY_FILE_FORMAT = "1"
+
+
 class MemoryStore:
     """线程安全的结构化记忆仓库。
 
     冲突规则：同 (scope, key) 写入时旧记录被 superseded（保留可追溯），
     不做静默覆盖——查询永远返回最新版本。
+
+    持久化：构造时传入 persist_path 后，所有变更（add/forget/forget_prefix）
+    自动全量快照落盘（原子写），重启后 load() 恢复。未传 persist_path 时
+    行为与纯内存仓库完全一致（测试与子 Agent 场景）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, persist_path: Optional[str] = None) -> None:
         self._lock = threading.RLock()
         self._records: dict[str, MemoryRecord] = {}
         self._counter = 0
+        self.persist_path = str(persist_path) if persist_path else ""
+        self.last_persist_error: str = ""
+
+    def _auto_save(self) -> None:
+        """变更后落盘。失败不抛出（记忆写失败不阻断任务流），错误留存在
+        last_persist_error 供审计/测试检查。"""
+        if not self.persist_path:
+            return
+        try:
+            self.save(self.persist_path)
+            self.last_persist_error = ""
+        except OSError as exc:
+            self.last_persist_error = f"{type(exc).__name__}: {exc}"[:200]
+
+    def save(self, path: str) -> None:
+        """全量快照落盘（临时文件 + os.replace 原子写）。
+
+        敏感记录也写入：文件位于本地 workspace（与画像 markdown 同级），
+        注入侧仍由 query 的敏感过滤把关，落盘不改变可见性语义。
+        """
+        import json
+
+        from .retrieval import _atomic_write_json
+
+        with self._lock:
+            payload = {
+                "format": MEMORY_FILE_FORMAT,
+                "counter": self._counter,
+                "records": [
+                    {
+                        "record_id": r.record_id,
+                        "scope": r.scope.value,
+                        "value": r.value,
+                        "source_id": r.source_id,
+                        "created_at": r.created_at,
+                        "updated_at": r.updated_at,
+                        "ttl_seconds": r.ttl_seconds,
+                        "capability_tags": list(r.capability_tags),
+                        "intent_tags": list(r.intent_tags),
+                        "sensitivity": r.sensitivity,
+                        "confidence": r.confidence,
+                        "session_id": r.session_id,
+                    }
+                    for r in self._records.values()
+                ],
+            }
+        _atomic_write_json(path, payload)
+
+    def load(self, path: str) -> int:
+        """启动恢复。文件缺失/损坏/格式不符返回 0（fail-open：记忆是可用性
+        数据而非安全边界，坏文件不阻断启动）；单条坏记录跳过不拖垮整体。
+        过期记录在加载时丢弃（不复活）；counter 恢复高水位防 record_id 碰撞。
+        """
+        import json
+
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError):
+            return 0
+        if payload.get("format") != MEMORY_FILE_FORMAT:
+            return 0
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list):
+            return 0
+        now = time.time()
+        loaded = 0
+        max_counter = 0
+        with self._lock:
+            for item in raw_records:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    record = MemoryRecord(
+                        record_id=str(item["record_id"]),
+                        scope=MemoryScope(item["scope"]),
+                        value=str(item.get("value", "")),
+                        source_id=str(item.get("source_id", "")),
+                        created_at=float(item.get("created_at", 0.0)),
+                        updated_at=float(item.get("updated_at", 0.0)),
+                        ttl_seconds=(
+                            float(item["ttl_seconds"])
+                            if item.get("ttl_seconds") is not None
+                            else None
+                        ),
+                        capability_tags=tuple(
+                            str(t) for t in item.get("capability_tags", ())
+                        ),
+                        intent_tags=tuple(
+                            str(t) for t in item.get("intent_tags", ())
+                        ),
+                        sensitivity=str(item.get("sensitivity", "normal")),
+                        confidence=float(item.get("confidence", 1.0)),
+                        session_id=str(item.get("session_id", "")),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if record.is_expired(now):
+                    continue
+                self._records[record.record_id] = record
+                loaded += 1
+                if record.record_id.startswith("mem-"):
+                    try:
+                        max_counter = max(max_counter, int(record.record_id[4:]))
+                    except ValueError:
+                        continue
+            self._counter = max(self._counter, max_counter)
+        return loaded
 
     def add(
         self,
@@ -115,7 +232,8 @@ class MemoryStore:
                 session_id=str(session_id or ""),
             )
             self._records[record_id] = record
-            return record
+        self._auto_save()
+        return record
 
     def query(
         self,
@@ -182,14 +300,20 @@ class MemoryStore:
 
     def forget(self, record_id: str) -> bool:
         with self._lock:
-            return self._records.pop(record_id, None) is not None
+            removed = self._records.pop(record_id, None) is not None
+        if removed:
+            self._auto_save()
+        return removed
 
     def forget_prefix(self, prefix: str) -> int:
         with self._lock:
             stale = [rid for rid in self._records if rid.startswith(prefix)]
             for rid in stale:
                 del self._records[rid]
-            return len(stale)
+            removed = len(stale)
+        if removed:
+            self._auto_save()
+        return removed
 
     def all_records(self) -> List[MemoryRecord]:
         with self._lock:

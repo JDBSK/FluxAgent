@@ -609,7 +609,18 @@ def create_agent_app(
             )
 
     if memory_store is None:
-        memory_store = MemoryStore()
+        # 结构化记忆持久化：重启恢复 episodic/task_state（画像 markdown 照旧
+        # 单独加载）。外部传入的 store（测试）不挂持久化，行为保持纯内存。
+        _memory_persist_path = os.path.join(MEMORY_DIR, "structured_memory.json")
+        memory_store = MemoryStore(persist_path=_memory_persist_path)
+        _restored = memory_store.load(_memory_persist_path)
+        if _restored:
+            audit_logger.log_event(
+                thread_id="system_default",
+                event="system_action",
+                action="structured_memory_restored",
+                count=_restored,
+            )
     try:
         ProfileCompatProvider(os.path.join(MEMORY_DIR, "user_profile.md")).load_into(
             memory_store

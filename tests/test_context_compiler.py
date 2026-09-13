@@ -107,6 +107,147 @@ class TestMemoryStore(unittest.TestCase):
             self.assertIn("饮食忌口：不吃香菜", values)
 
 
+class TestMemoryStorePersistence(unittest.TestCase):
+    """重启恢复：持久化往返、TTL 不复活、会话隔离保留、坏文件 fail-open。"""
+
+    def _make_store(self, path):
+        store = MemoryStore(persist_path=path)
+        store.add(
+            MemoryScope.USER_FACT, "家庭人数：3人", key="profile.household"
+        )
+        store.add(
+            MemoryScope.TASK_STATE,
+            "当前任务：分析股票行情",
+            key="task.s1",
+            capability_tags=("cap.market",),
+            ttl_seconds=3600,
+            session_id="session-a",
+        )
+        return store
+
+    def test_round_trip_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "structured_memory.json")
+            store = self._make_store(path)
+            self.assertTrue(os.path.exists(path))
+            restored = MemoryStore(persist_path=path)
+            self.assertEqual(restored.load(path), 2)
+            values = {
+                r.value for r in restored.query(scopes=[MemoryScope.USER_FACT])
+            }
+            self.assertEqual(values, {"家庭人数：3人"})
+            # 会话级记录按原 session 边界可见
+            scoped = restored.query(
+                scopes=[MemoryScope.TASK_STATE],
+                capability_id="cap.market",
+                session_id="session-a",
+            )
+            self.assertEqual(
+                [r.value for r in scoped], ["当前任务：分析股票行情"]
+            )
+
+    def test_expired_records_not_revived(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "structured_memory.json")
+            store = MemoryStore(persist_path=path)
+            store.add(
+                MemoryScope.TASK_STATE,
+                "早已过期",
+                key="task.old",
+                ttl_seconds=100,
+                now=1000.0,
+            )
+            store.add(MemoryScope.USER_FACT, "长期事实", now=1000.0)
+            restored = MemoryStore()
+            self.assertEqual(restored.load(path), 1)
+            self.assertEqual(
+                [r.value for r in restored.query()], ["长期事实"]
+            )
+
+    def test_session_isolation_preserved_after_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "structured_memory.json")
+            self._make_store(path)
+            restored = MemoryStore(persist_path=path)
+            restored.load(path)
+            # 全局记录任何会话可见；会话 A 的 task_state 不泄漏给会话 B，
+            # 无会话上下文（session_id=None）时一律排除（fail-closed）
+            self.assertEqual(
+                [r.value for r in restored.query(session_id="session-b")],
+                ["家庭人数：3人"],
+            )
+            self.assertEqual(
+                len(restored.query(scopes=[MemoryScope.TASK_STATE], session_id="session-b")),
+                0,
+            )
+            self.assertEqual(len(restored.query(session_id=None)), 1)
+
+    def test_corrupt_file_fails_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "structured_memory.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not valid json")
+            store = MemoryStore(persist_path=path)
+            self.assertEqual(store.load(path), 0)
+            # 坏文件不阻断使用；下一次变更自动写出好快照
+            store.add(MemoryScope.USER_FACT, "恢复后写入")
+            again = MemoryStore()
+            self.assertEqual(again.load(path), 1)
+
+    def test_format_mismatch_rejected(self):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "structured_memory.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                _json.dump({"format": "999", "records": []}, fh)
+            self.assertEqual(MemoryStore().load(path), 0)
+
+    def test_auto_save_on_forget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "structured_memory.json")
+            store = self._make_store(path)
+            store.forget("user_fact:profile.household")
+            again = MemoryStore()
+            again.load(path)
+            # 全局画像记录已被删除；会话级 task_state 仍在原会话边界内
+            self.assertEqual([r.value for r in again.query()], [])
+            self.assertEqual(
+                [
+                    r.value
+                    for r in again.query(
+                        capability_id="cap.market", session_id="session-a"
+                    )
+                ],
+                ["当前任务：分析股票行情"],
+            )
+
+    def test_counter_high_water_no_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "structured_memory.json")
+            store = MemoryStore(persist_path=path)
+            first = store.add(MemoryScope.USER_FACT, "无键记录一")
+            self.assertEqual(first.record_id, "mem-1")
+            restored = MemoryStore(persist_path=path)
+            restored.load(path)
+            second = restored.add(MemoryScope.USER_FACT, "无键记录二")
+            self.assertEqual(second.record_id, "mem-2")
+            self.assertEqual(len(restored.query()), 2)
+
+    def test_persist_error_recorded_not_raised(self):
+        # 父路径是普通文件时 makedirs 失败（OSError）：落盘失败被吞掉并记录，
+        # 不阻断 add 调用方
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_dir = os.path.join(tmp, "not_a_dir")
+            with open(not_a_dir, "w", encoding="utf-8") as fh:
+                fh.write("file, not directory")
+            path = os.path.join(not_a_dir, "nested.json")
+            store = MemoryStore(persist_path=path)
+            record = store.add(MemoryScope.USER_FACT, "写入会失败")
+            self.assertIsNotNone(record)
+            self.assertIn("Error", store.last_persist_error)
+
+
 class TestContextCompiler(unittest.TestCase):
     def test_relevant_memory_injected_with_reason(self):
         compiler = ContextCompiler(store_with_facts(), token_budget=4000)
