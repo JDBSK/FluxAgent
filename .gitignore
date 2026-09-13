@@ -57,3 +57,6 @@ _tmp_*.py
 
 # baseline worktree for before/after comparison
 .baseline-wt/
+
+# local scratch (moved debug scripts, never tracked)
+scratch/
