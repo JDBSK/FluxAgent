@@ -472,6 +472,7 @@ class HybridRouter:
         *,
         explicit_capability: Optional[str] = None,
         context_turns: Optional[Sequence[str]] = None,
+        hint_fallback_to_retrieval: bool = False,
     ) -> RouteDecision:
         text = str(user_text or "").strip()
         # 索引失效只看内容版本：健康翻转走契约/Gateway 失效路径，不重建索引
@@ -489,7 +490,9 @@ class HybridRouter:
                     audit={"path": "decide", "error": str(exc)[:200]},
                 )
 
-        resolved = explicit_capability or self._resolve_explicit(text, snapshot)
+        resolved = explicit_capability or self._resolve_explicit(
+            text, snapshot, hint_fallback_to_retrieval=hint_fallback_to_retrieval
+        )
         if resolved is not None:
             return self._decide_explicit(resolved, text, snapshot)
 
@@ -522,8 +525,19 @@ class HybridRouter:
             ) is not None
         return alias in lowered_text
 
-    def _resolve_explicit(self, text: str, snapshot: RegistrySnapshot) -> Optional[str]:
-        """解析'使用 X mcp/skill'语法和别名包含；最长匹配，并列视为歧义。"""
+    def _resolve_explicit(
+        self,
+        text: str,
+        snapshot: RegistrySnapshot,
+        *,
+        hint_fallback_to_retrieval: bool = False,
+    ) -> Optional[str]:
+        """解析'使用 X mcp/skill'语法和别名包含；最长匹配，并列视为歧义。
+
+        hint_fallback_to_retrieval：别名无命中但出现"用/调用 ... 服务"句式时，
+        True 返回 None（回落检索，供短步骤文本等生成式输入使用）；默认 False
+        返回 ""（fail-closed clarify，用户显式点名未注册后端必须澄清）。
+        """
         alias_map: Dict[str, List[str]] = {}
         for capability in snapshot.enabled_capabilities():
             if capability.kind == "builtin":
@@ -556,7 +570,7 @@ class HybridRouter:
 
         hint = _EXPLICIT_PATTERN.search(text)
         if hint:
-            return ""  # 有显式路由意图但没有已注册能力匹配 → fail closed（clarify）
+            return "" if not hint_fallback_to_retrieval else None
         return None
 
     def _decide_explicit(

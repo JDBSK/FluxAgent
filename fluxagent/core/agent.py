@@ -94,6 +94,7 @@ from ..capability.providers import descriptors_from_tools
 from ..capability.registry import CapabilityRegistry, RegistryError, RegistrySnapshot
 from ..capability.retrieval import load_embedding_provider
 from ..capability.router import (
+    HeuristicReranker,
     HybridRouter,
     InvocationContract,
     LLMReranker,
@@ -592,6 +593,13 @@ def create_agent_app(
                 action="router_llm_reranker_failed",
                 error=str(exc)[:200],
             )
+    # 步骤级重路由专用路由器：高召回词法路径——LLM 重排的保守 abstain 适合
+    # 用户主请求，但 planner 改写的短步骤文本词面弱、需要检索兜底；扩权精度
+    # 仍由覆盖度门槛与 Gateway 执行前校验把关
+    _step_router = HybridRouter(
+        embedding_provider=_router.embedding_provider,
+        reranker=HeuristicReranker(order_by="retrieval"),
+    )
     # 索引持久化：registry 版本 + embedding tag + 索引格式版本三重匹配才复用，
     # 否则重建并落盘。目录锚定在 MEMORY_DIR 内——测试把 MEMORY_DIR patch 到
     # 临时目录时，持久化文件仍严格留在允许的目录边界内。
@@ -919,12 +927,15 @@ def create_agent_app(
             # 契约已因注册表变化过期，交回既有失效/重路由路径处理
             return decision, contract, scoped_tools
 
-        # 显式解析/歧义/提示词命中未注册——全部由 Router 自身的 fail-closed
-        # 语义处理（clarify/abstain → 不扩权），这里不做二次解释；
-        # context_turns 供 abstain 时的会话上下文救援（planner 改写步骤文本
-        # 常丢失能力关键词，原请求文本可补足词面证据）
-        step_decision = _router.decide(
-            action_text, snapshot, context_turns=[user_text]
+        # 显式解析/歧义仍 fail-closed（clarify → 不扩权）；但 planner 常把步骤
+        # 改写成"调用 X 服务"句式，X 多数并非注册别名——此时不视为显式点名，
+        # 回落检索（hint_fallback_to_retrieval）；context_turns 供 abstain 时的
+        # 会话上下文救援（步骤文本常丢失能力关键词，原请求文本可补足词面证据）
+        step_decision = _step_router.decide(
+            action_text,
+            snapshot,
+            context_turns=[user_text],
+            hint_fallback_to_retrieval=True,
         )
         new_caps = tuple(
             cap_id

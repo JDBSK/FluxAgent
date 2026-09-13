@@ -94,10 +94,10 @@ python -m tests.eval.llmjudge.final_report                          :: 最终聚
 
 | 项 | 状态 |
 |---|---|
-| MemoryStore 持久化（重启恢复，fail-open） | ✅ L0 8 例 |
+| MemoryStore 持久化（重启恢复，fail-open） | ✅ L0 8 例 + 端到端真实验证 3/3（重启→恢复→再注入 + 无持久化对照） |
 | 快照 content_version 拆分：健康抖动不再触发索引重建 | ✅ 计数断言 |
 | LLM 路由重排（FLUXAGENT_ROUTER_MODEL）+ 真实复测 | ✅ 修复 5/回退 2，总分持平 |
-| 步骤级重路由（只增不删扩权，fail-closed） | ✅ 真实 5 场景 oracle 4/5，judge 一致率 1.0、误判通过 0、AB 翻转 0 |
+| 步骤级重路由（只增不删扩权，fail-closed + 会话上下文救援 + 高召回专用路由器） | ✅ 真实 4 能力×5 族×32 trials：oracle 87.5%（Wilson CI [71.9%, 95.0%]），未注册/对照族 100%，32 条零未授权绑定；judge 一致率 0.875；迭代三轮全部留证 |
 | tests/conftest.py 路由 LLM 环境隔离 | ✅ |
 
 详见 `CAPABILITY_ROUTING_EVALUATION.md` 第 7 节。无用文件待清理项已移交 `scratch/无用文件待清理.txt`。

@@ -103,17 +103,27 @@ run_overnight.cmd   :: 回归 -> 能力测试 -> 定向测评（含规模扫描�
 
 ### 7.2 真实模型定向证据（Deepseek-v4-flash，与 SUT 同款 judge，沿用既有口径声明）
 
-**LLM 重排 vs 启发式（22 标注查询，`retrieval_metrics --llm-reranker`）**：
+**LLM 重排 vs 启发式（22 标注查询，`retrieval_metrics --llm-reranker`；judge 与 SUT 同款模型，沿用既有口径声明）**：
 
 - decision_accuracy 打平（0.8333 vs 0.8333），但错误结构改变：修复 5 例（2 例语义改写/跨语言 + 3 例"提及≠请求"边界 abstain），回退 2 例（域内近义混淆：行情 vs K线、营养双问句），judge 故障回退 0 例。
 - 结论：LLM 重排的价值在语义与边界（ abstain 判定），不在词法可达查询；二者互补，总分持平。
 
-**步骤级重路由端到端（5 场景，`step_reroute_eval`）**：
+**步骤级重路由端到端（4 能力 × 5 场景族 × 32 trials，`step_reroute_eval` v5，真实模型 + judge + AB 换序）**：
 
-- 机械 oracle 4/5：跨能力正例（能力顺序互换）、三步链（builtin 尾步不误扩权）、未注册负例（不扩权、不执行替代工具）、单能力对照全部通过。
-- 1 例 fail（cook_then_market）归因：**机制正常**（第 2 轮起绑定面已扩充、`step_reroute_expanded` 审计在案），模型重复调用首步工具后错误声称"未被授权"——属模型行为方差，judge 如实捕获。
-- judge 校准：judge-oracle 一致率 1.0，**误判通过 0**；AB 换序（证据逆序重评）方向翻转 0。
-- 部署级发现（首轮真实运行暴露）：能力卡描述为 generic 占位（"计数工具 ..."）时，步骤文本检索无证据、重路由 abstain——**语料质量是路由召回的上限**，与生产 MCP 卡描述丰富度直接相关。
+| 族 | n | oracle 通过 | 说明 |
+|---|---|---|---|
+| cross_two_step 两步跨能力 | 10 | 7 | 第二步能力经步骤级重路由授权后执行 |
+| chain_three_step 三步两切换 | 6 | 5 | 两个新能力均需扩权 |
+| unregistered_second 未注册负例 | 4 | **4** | 不扩权、不执行替代工具、如实说明 |
+| single_capability_control 同能力对照 | 6 | **6** | 零误扩权 |
+| off_domain_step 无关步骤混入 | 6 | **6** | 无关步骤零错配 |
+| **合计** | **32** | **28（87.5%，Wilson 95% CI [71.9%, 95.0%]）** | |
+
+- **安全不变量 32/32 满分**：全程零未授权工具绑定、零未注册能力执行。
+- judge 校准：judge-oracle 一致率 0.875，误判通过 3（judge 对"模型自行完成翻译"的宽容判定与机械 oracle 的口径差）；AB 换序翻转 4。
+- 剩余 4 例 fail 全部为**模型行为方差**（扩权成功但模型未调用已授权工具、或启发式 top-1 同域歧义），机制侧（扩权事件、绑定面）均正常，非产品缺陷。
+- **评测迭代过程本身即工程证据**：v2 暴露渠道 429 并发限流（8 例 error）→ 加 SUT 指数退避重试与 trial 间隔（对齐 llmjudge 框架的 SUT 容错语义）；v3 暴露 planner 改写步骤丢失能力关键词 → 产品加会话上下文救援；v4 暴露"调用 X 服务"句式误触显式 fail-closed → router 增加 `hint_fallback_to_retrieval`（步骤文本回落检索，用户显式点名仍 clarify）；另发现 LLM 重排对短步骤文本过度保守 → 步骤级重路由改用高召回词法专用路由器（精度由覆盖度门槛 + Gateway 兜底）。三轮迭代全部有 per-trial JSONL 留证（`artifacts/step_reroute_eval_v2/v3/v4/v5.jsonl`）。
+- 部署级发现（首轮真实运行暴露）：能力卡描述为 generic 占位时步骤文本检索无证据、重路由 abstain——**语料质量是路由召回的上限**。
 
 ### 7.3 回归状态
 
