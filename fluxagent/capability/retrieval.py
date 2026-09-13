@@ -243,7 +243,11 @@ class DenseIndex:
             payload = {
                 "model_tag": self.model_tag,
                 "items": [
-                    {"doc_id": doc_id, "payload": dict(self._payloads.get(doc_id, {})), "vector": self._vectors[doc_id]}
+                    {
+                        "doc_id": doc_id,
+                        "payload": str(self._payloads.get(doc_id, "")),
+                        "vector": self._vectors[doc_id],
+                    }
                     for doc_id in self._ids
                 ],
             }
@@ -258,8 +262,8 @@ class DenseIndex:
         index = cls()
         index.model_tag = payload.get("model_tag", "")
         index._ids = [item["doc_id"] for item in payload["items"]]
-        index._payloads = {item["doc_id"]: item.get("payload", {}) for item in payload["items"]}
-        index._vectors = {item["doc_id"]: item["vector"] for item in payload["items"]}
+        index._payloads = {item["doc_id"]: str(item.get("payload", "")) for item in payload["items"]}
+        index._vectors = {item["doc_id"]: list(item["vector"]) for item in payload["items"]}
         return index
 
 

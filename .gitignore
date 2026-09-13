@@ -53,3 +53,4 @@ _retest_*.txt
 _run_full_eval.cmd
 _tmp_*.cmd
 artifacts/
+_tmp_*.py

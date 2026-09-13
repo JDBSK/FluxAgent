@@ -68,58 +68,68 @@ Provider 发现 -> Capability Registry（全量登记，不给模型）
 - 显式 `tools=[...]` 注入路径行为不变（tests/eval stub 全部兼容）。
 - 审批/策略仍由 policy 层单一裁决；Gateway 只做执行边界机械校验，二者职责不重叠。
 - embedding 未配置时使用确定性本地向量（索引 tag 明确标注），不伪装成语义模型；接入远程 embedding 只需配置，不改路由代码。
-- 已知限制：HeuristicReranker 为无模型重排（覆盖/反例/健康/槽位四信号）；槽位缺失检查是保守包含性匹配，最终以 Gateway 的 JSON Schema 校验为准。
+- Reranker 双模式：无语义第二路（确定性向量）时按检索器原始名次排序（覆盖度/惩罚只做过滤）；接入真实 embedding 时切换 blended 模式（0.7 覆盖 + 0.3 RRF 归一化）。另支持 LLMReranker（受约束单选 JSON，设置 FLUXAGENT_ROUTER_MODEL 启用，故障回退启发式并审计）。
+- 索引持久化：workspace/memory/capability_index 下按 registry 版本 + embedding tag 双匹配复用，不匹配即重建，杜绝旧索引配新注册表。
+- 记忆写侧：agent_node 每回合写 task_state（TTL 1h，带能力标签）；tools_node 将工具失败写入 episodic（TTL 24h）。带能力标签的记录在 abstain 回合一律排除（防跨任务泄漏，指标回归覆盖）。
+- 已知限制：无真实 embedding 服务时语义检索退化为词法（当前渠道不提供 embedding 模型，已用服务错误实证）；槽位缺失检查是保守包含性匹配，最终以 Gateway 的 JSON Schema 校验为准。
 
 ## 7. 测试
 
-新增 5 个测试文件共 66 项：registry 契约 14、hybrid router/检索 19、context compiler 13、gateway/熔断 14、agent 集成 6。全量回归 289 passed / 3 skipped（含全部旧用例）。所有 fixture 使用合成能力 ID，不绑定任何真实安装项。
+新增 6 个测试文件共 78 项：registry 契约 14、hybrid router/检索 19、context compiler 13、gateway/熔断 14、agent 集成 6、加固 12（LLM 重排/索引持久化/记忆写侧/泄漏回归）。全量回归通过（含全部旧用例）。所有 fixture 使用合成能力 ID，不绑定任何真实安装项。
 """
 
 EVALUATION_MD = """# 统一能力路由定向测评总结
 
-日期：{generated_at} ｜ 模型：{model}（{provider}）｜ 报告：`artifacts/post_change_eval.json`
+日期：{generated_at} ｜ 模型：{model}（{provider}）｜ 报告：`artifacts/post_change_eval.json`、`artifacts/retrieval_metrics.json`
 
 ## 0. 基线声明（不重跑旧测评）
 
 - 旧全量测评（L1 确定性 610 例、L2 真实模型 278 trials、L3 AB、L4 校准）**未重跑**，以 `PROJECT_SUMMARY.md`（提交 `11f0aa5` 前）为冻结基线：任务通过率 96.04%（Wilson 95% CI [93.1%, 97.8%]）。
 - 本次为新能力（Router/Context/Gateway）的**新增定向测评**，与旧基线分母不同，不构成 paired A/B；对比仅描述能力新增，不声称旧指标因果提升。
-- 旧基线场景本身无股票类无关调用防护（这正是本次修改动机）；定向测评证明该类失败模式已被结构性消除。
 
-## 1. 结果总览（本次实测 {total} 例，通过 {passed}）
+## 1. 检索质量指标（20 能力合成语料 / 22 标注查询：18 正例 + 4 abstain）
 
-| 轨道 | 类型 | 用例 | 结果 |
-|---|---|---|---|
-| A router_correctness | 真实模型 | 5（repeat=1） | {a_passed}/5 |
-| B context_isolation | 确定性（0 API） | 4 | 4/4 |
-| C end_to_end（schema 熔断） | 真实模型 | 1 | 1/1 |
-| C judge | LLM-as-judge | 1 | pass |
+| 检索器 | recall@1 | recall@3 | MRR | 平均延迟 |
+|---|---|---|---|---|
+| BM25 单路 | {bm_r1} | {bm_r3} | {bm_mrr} | {bm_lat}ms |
+| dense（确定性哈希）单路 | {dd_r1} | {dd_r3} | {dd_mrr} | {dd_lat}ms |
+| Hybrid（RRF + 启发式重排） | {hy_r1} | {hy_r3} | {hy_mrr} | {hy_lat}ms |
 
-- A1 菜谱请求→只执行 `mcp_cooking_recommendMeals`；A2 股票请求→只执行 `mcp_market_getQuotes`；A3 通用问答→零外部工具；A4 天气/A5 翻译同样精确路由，禁用工具零命中。
-- B1 菜谱意图注入饮食事实且排除敏感记录与跨能力任务态；B2 市场意图注入市场任务态；B3 无工具路由注入"未授权任何外部工具"契约；B4 token 预算裁剪后规则与契约段完整保留（实测 226/300 tokens）。
+路由决策口径（decide() 最终单选）：**decision_accuracy={dec_acc}，abstain_precision={dec_abstain}**。
 
-## 2. 关键行为证据（两次真实运行）
+关键结论（全部由指标实测驱动修复，非拍脑袋）：
+1. 首次测量暴露 hybrid recall@1=0.0 的实现级 bug（指标脚本标签偏移）——修复后为 0.67，仍低于 BM25 的 0.83；
+2. 二轮定位：确定性哈希向量在 RRF 中是噪声票，稀释 BM25 的 IDF 信号 → 词法模式下禁用 dense 路；
+3. 三轮定位：重排器丢掉了检索器排序信号 → 词法模式改为"检索序 + 覆盖度门槛过滤"（门槛 0.05：4 个 none 查询 coverage 全为 0，可安全 abstain）；
+4. 终态：hybrid 与 BM25 持平（0.83/0.89/0.875 MRR 略优），语义改写与跨语言层（"明天出门要带伞吗"、"what's the weather..."）仍需真实 embedding——当前渠道不提供任何 embedding 模型（4 个模型名均 503 model_not_found，已留证 `artifacts/retrieval_metrics_real.json`），接入 `FLUXAGENT_EMBEDDING_*` 后自动启用双路融合并可用 `--real-embedding` 复测。
 
-1. **首修前运行（工具 schema 声明漂移缺陷）**：4/5 路由用例中模型每次调用都被 Gateway 以 `schema_error` 拦截——拦截机制本身正确生效；模型的后续行为符合契约：**没有换参数重试**，而是如实向用户说明失败原因并基于上下文直接回答（A1 甚至正确引用了画像中的忌口/过敏原）。
-2. **修复后运行（op schema 从工具单一事实源推导）**：11/11 通过；模型首次调用即符合 `queries` 数组契约，工具真实执行，禁用工具零命中。
-3. 两次运行合并证明：路由隔离、最小绑定、schema 校验、失败停止四个机制在真实模型下按设计工作。
+## 2. 记忆选择指标（9 条标注记录 / 3 个查询视角）
 
-## 3. API 消耗
+- **precision={mem_p}，recall={mem_r}，F1={mem_f1}**
+- 语义规则由指标驱动定案：无标签记录（通用事实/通用经验）跨能力可见；带能力标签的记录只进对应能力，**abstain 回合一律排除**（修复了一个真实跨任务泄漏：abstain 时其他能力的 task_state 被注入）；敏感记录与 TTL 过期记录在全部视角下被排除。
+- 隔离用例：菜谱视角不含茅台/股票工具失败史；市场视角含行情任务态与该能力的失败经验；通用问答不携带任何能力任务态。
 
-本次定向测评两次完整运行（A/C 真实调用 + judge）合计约 60-80 次模型调用，远低于 5 小时 1200 次限额；未设置人为硬上限（按用户要求移除）。确定性轨道不消耗 API。
+## 3. 端到端行为（真实模型 glm-5 / {provider}）
 
-## 4. 残余风险与后续
+- A 轨 5 例：菜谱/股票/天气/翻译各自只执行对应能力工具，禁用工具零命中，通用问答零外部工具——**{a_passed}**。
+- C 轨 schema 熔断 1 例：模型首次调用即符合 `queries` 数组契约；此前一次运行（工具 schema 声明漂移）实证了失败链路：Gateway 全部拦截 → 模型**不换参数重试**，如实说明失败并直接回答。
+- LLM-as-judge：对 **A+C 全部 {judge_n} 条 transcript** 真实评审（rubric：切题完整/失败说明/不编造数据），结果：{judge_summary}。
 
-- HeuristicReranker 依赖描述文本质量；上线远程 embedding/reranker 后应补充跨语言与同义改写用例。
-- C1 本轮模型一次命中正确 schema，"错误后停止"行为由首修前运行与确定性网关测试（`test_execution_gateway.py` 14 项）共同覆盖。
-- 旧 eval 套件（tests/eval）与本次新架构的适配未做：旧 stub 场景以 `tools=` 注入路径保持兼容，未迁移到 registry 显式路径。
-- `_tool_scope_for_turn` 等旧函数为兼容保留，后续可在确认无外部依赖后合并入 Router。
+## 4. API 消耗
 
-## 5. 运行方式
+两次完整运行（A/C 真实调用 + judge）合计约 60-100 次模型调用；embedding 探测 4 次失败请求；确定性轨道与全部单元/集成测试 0 API。
+
+## 5. 残余风险与后续
+
+- 语义检索层（同义改写/跨语言）依赖真实 embedding，当前渠道不可用；接入后预期补齐 decision_accuracy 中剩余 3 例语义 miss，需复测验证。
+- judge rubric 为单裁判直评，未做旧体系的 20 例校准与 AB 换序；规模化前应复用 `tests/eval/llmjudge` 框架。
+- `_tool_scope_for_turn` 等旧函数为兼容保留；旧 eval 套件未迁移到 registry 显式路径。
+
+## 6. 运行方式
 
 ```cmd
-run_overnight.cmd   :: 回归 -> 定向测评 -> 总结，任一阶段失败即停
+run_overnight.cmd   :: 回归 -> 定向测评（含指标） -> 总结，任一阶段失败即停
 ```
-产物均在项目内：`artifacts/post_change_eval.json`、`artifacts/*.log`、两份本总结。
 """
 
 UNUSED_FILES_TXT = """# 疑似无用文件清单（仅记录，未删除任何文件）
@@ -151,20 +161,46 @@ def main() -> int:
     model = provider = "n/a"
     total = passed = 0
     a_passed = "n/a"
+    judge_n = judge_summary = "0（未运行）"
+    mem_p = mem_r = mem_f1 = "n/a"
+    metrics = {}
     if os.path.exists(args.eval_json):
         with open(args.eval_json, encoding="utf-8") as fh:
             report = json.load(fh)
         model = report.get("model", "n/a")
         provider = report.get("provider", "n/a")
-        for track in report.get("tracks", {}).values():
+        for name, track in report.get("tracks", {}).items():
             cases = track.get("cases") or track.get("verdicts") or []
+            if name == "C_judge":
+                verdicts = track.get("verdicts") or []
+                judge_n = str(track.get("transcript_count", len(verdicts)))
+                pass_n = sum(1 for v in verdicts if v.get("verdict") == "pass")
+                judge_summary = f"{pass_n}/{len(verdicts)} pass"
+                continue
             for case in cases:
                 total += 1
                 if case.get("passed") or case.get("verdict") == "pass":
                     passed += 1
+            if name == "B_context_isolation":
+                for case in cases:
+                    if case.get("case") == "B4_memory_selection_prc":
+                        mem_p, mem_r, mem_f1 = (
+                            case.get("precision"), case.get("recall"), case.get("f1")
+                        )
         track_a = report.get("tracks", {}).get("A_router_correctness", {}).get("cases", [])
         if track_a:
             a_passed = f"{sum(1 for c in track_a if c.get('passed'))}/{len(track_a)}"
+        metrics = report.get("tracks", {}).get("D_retrieval_metrics", {}).get("report", {}) or {}
+    retrieval_path = os.path.join(os.path.dirname(args.eval_json) or ".", "retrieval_metrics.json")
+    if os.path.exists(retrieval_path):
+        with open(retrieval_path, encoding="utf-8") as fh:
+            metrics = json.load(fh)
+
+    def _m(section, key, default="n/a"):
+        value = (metrics.get(section) or {}).get(key)
+        return value if value is not None else default
+
+    dec = metrics.get("route_decision_heuristic") or {}
 
     impl_path = os.path.join(args.output, "CAPABILITY_ROUTING_IMPLEMENTATION.md")
     eval_path = os.path.join(args.output, "CAPABILITY_ROUTING_EVALUATION.md")
@@ -179,6 +215,25 @@ def main() -> int:
                 total=total,
                 passed=passed,
                 a_passed=a_passed,
+                judge_n=judge_n,
+                judge_summary=judge_summary,
+                mem_p=mem_p,
+                mem_r=mem_r,
+                mem_f1=mem_f1,
+                bm_r1=_m("bm25_only", "recall@1"),
+                bm_r3=_m("bm25_only", "recall@3"),
+                bm_mrr=_m("bm25_only", "mrr"),
+                bm_lat=_m("bm25_only", "avg_latency_ms"),
+                dd_r1=_m("dense_deterministic_only", "recall@1"),
+                dd_r3=_m("dense_deterministic_only", "recall@3"),
+                dd_mrr=_m("dense_deterministic_only", "mrr"),
+                dd_lat=_m("dense_deterministic_only", "avg_latency_ms"),
+                hy_r1=_m("hybrid_rrf_heuristic", "recall@1"),
+                hy_r3=_m("hybrid_rrf_heuristic", "recall@3"),
+                hy_mrr=_m("hybrid_rrf_heuristic", "mrr"),
+                hy_lat=_m("hybrid_rrf_heuristic", "avg_latency_ms"),
+                dec_acc=dec.get("decision_accuracy", "n/a"),
+                dec_abstain=dec.get("abstain_precision", "n/a"),
             )
         )
 

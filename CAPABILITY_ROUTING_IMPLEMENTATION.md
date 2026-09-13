@@ -1,6 +1,6 @@
 # 统一能力路由与 Context Compiler 实现总结
 
-日期：2026-09-12 18:43 UTC ｜ 分支：`feature/capability-routing-context`（基线 `11f0aa5`）
+日期：2026-09-13 04:29 UTC ｜ 分支：`feature/capability-routing-context`（基线 `11f0aa5`）
 
 ## 1. 解决的问题
 
@@ -54,8 +54,11 @@ Provider 发现 -> Capability Registry（全量登记，不给模型）
 - 显式 `tools=[...]` 注入路径行为不变（tests/eval stub 全部兼容）。
 - 审批/策略仍由 policy 层单一裁决；Gateway 只做执行边界机械校验，二者职责不重叠。
 - embedding 未配置时使用确定性本地向量（索引 tag 明确标注），不伪装成语义模型；接入远程 embedding 只需配置，不改路由代码。
-- 已知限制：HeuristicReranker 为无模型重排（覆盖/反例/健康/槽位四信号）；槽位缺失检查是保守包含性匹配，最终以 Gateway 的 JSON Schema 校验为准。
+- Reranker 双模式：无语义第二路（确定性向量）时按检索器原始名次排序（覆盖度/惩罚只做过滤）；接入真实 embedding 时切换 blended 模式（0.7 覆盖 + 0.3 RRF 归一化）。另支持 LLMReranker（受约束单选 JSON，设置 FLUXAGENT_ROUTER_MODEL 启用，故障回退启发式并审计）。
+- 索引持久化：workspace/memory/capability_index 下按 registry 版本 + embedding tag 双匹配复用，不匹配即重建，杜绝旧索引配新注册表。
+- 记忆写侧：agent_node 每回合写 task_state（TTL 1h，带能力标签）；tools_node 将工具失败写入 episodic（TTL 24h）。带能力标签的记录在 abstain 回合一律排除（防跨任务泄漏，指标回归覆盖）。
+- 已知限制：无真实 embedding 服务时语义检索退化为词法（当前渠道不提供 embedding 模型，已用服务错误实证）；槽位缺失检查是保守包含性匹配，最终以 Gateway 的 JSON Schema 校验为准。
 
 ## 7. 测试
 
-新增 5 个测试文件共 66 项：registry 契约 14、hybrid router/检索 19、context compiler 13、gateway/熔断 14、agent 集成 6。全量回归 289 passed / 3 skipped（含全部旧用例）。所有 fixture 使用合成能力 ID，不绑定任何真实安装项。
+新增 6 个测试文件共 78 项：registry 契约 14、hybrid router/检索 19、context compiler 13、gateway/熔断 14、agent 集成 6、加固 12（LLM 重排/索引持久化/记忆写侧/泄漏回归）。全量回归通过（含全部旧用例）。所有 fixture 使用合成能力 ID，不绑定任何真实安装项。

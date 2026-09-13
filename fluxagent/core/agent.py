@@ -84,6 +84,7 @@ from .tools.builtins import BUILTIN_TOOLS
 from ..capability.context_compiler import (
     CompilationContext,
     ContextCompiler,
+    MemoryScope,
     MemoryStore,
     ProfileCompatProvider,
 )
@@ -92,7 +93,12 @@ from ..capability.gateway import CircuitBreaker, ExecutionGateway
 from ..capability.providers import descriptors_from_tools
 from ..capability.registry import CapabilityRegistry, RegistryError, RegistrySnapshot
 from ..capability.retrieval import load_embedding_provider
-from ..capability.router import HybridRouter, InvocationContract, RouteDecision
+from ..capability.router import (
+    HybridRouter,
+    InvocationContract,
+    LLMReranker,
+    RouteDecision,
+)
 
 MAX_RETRY              = 3                                                   # 单个步骤的最大重试次数，超过则进入 replan
 MAX_REPLAN             = 2                                                   # 单个任务的最大重规划次数，超过则失败
@@ -554,7 +560,51 @@ def create_agent_app(
                     capability=descriptor.capability_id,
                     error=str(exc)[:200],
                 )
-    _router = HybridRouter(embedding_provider=load_embedding_provider(None))
+    _router = HybridRouter(
+        embedding_provider=load_embedding_provider({
+            "base_url": os.getenv("FLUXAGENT_EMBEDDING_BASE_URL", ""),
+            "api_key": os.getenv("FLUXAGENT_EMBEDDING_API_KEY", ""),
+            "model": os.getenv("FLUXAGENT_EMBEDDING_MODEL", ""),
+        }),
+        top_k=8,
+    )
+    # 受约束 LLM 路由重排：设置 FLUXAGENT_ROUTER_MODEL 即启用；故障自动回退启发式
+    _router_model = os.getenv("FLUXAGENT_ROUTER_MODEL", "").strip()
+    if _router_model:
+        try:
+            _router_chat = get_provider(
+                provider_name=os.getenv("DEFAULT_PROVIDER", "aliyun"),
+                model_name=_router_model,
+            )
+            _router.reranker = LLMReranker(_router_chat)
+            audit_logger.log_event(
+                thread_id="system_default",
+                event="system_action",
+                action="router_llm_reranker_enabled",
+                model=_router_model,
+            )
+        except Exception as exc:  # noqa: BLE001 - LLM 重排不可用时保持启发式
+            audit_logger.log_event(
+                thread_id="system_default",
+                event="system_action",
+                action="router_llm_reranker_failed",
+                error=str(exc)[:200],
+            )
+    # 索引持久化：registry 版本 + embedding tag 双重匹配才复用，否则重建并落盘。
+    # 目录锚定在 MEMORY_DIR 内——测试把 MEMORY_DIR patch 到临时目录时，
+    # 持久化文件仍严格留在允许的目录边界内。
+    _index_dir = os.path.join(MEMORY_DIR, "capability_index")
+    if not _router.load_index(_index_dir, capability_registry.snapshot()):
+        _router.rebuild_index(capability_registry.snapshot())
+        try:
+            _router.save_index(_index_dir)
+        except OSError as exc:
+            audit_logger.log_event(
+                thread_id="system_default",
+                event="system_action",
+                action="capability_index_persist_failed",
+                error=str(exc)[:200],
+            )
     _router.rebuild_index(capability_registry.snapshot())
 
     if memory_store is None:
@@ -655,18 +705,28 @@ def create_agent_app(
                     scoped = _dedupe_tools(scoped)
                     label = explicit
                     if capability is not None and capability.kind == "prompt_skill":
-                        # Prompt Skill：零工具，只注入受限上下文
+                        # Prompt Skill：零外部工具，只注入受限上下文；
+                        # 常驻 builtin 工具并入契约，保持本地动作可用
                         decision = RouteDecision(
                             route="route",
                             intent=capability.intents[0] if capability.intents else explicit,
                             capability_ids=(explicit,),
+                            allowed_tool_ids=tuple(str(t.name) for t in always),
                             registry_version=snapshot.version,
-                            memory_scopes=("user_fact", "user_preference", "skill_context"),
+                            memory_scopes=(
+                                "user_fact",
+                                "user_preference",
+                                "task_state",
+                                "skill_context",
+                            ),
                             reason=f"显式路由到 Prompt Skill {explicit}",
                             audit={"path": "explicit", "kind": "prompt_skill"},
                         )
-                        contract = InvocationContract(decision=decision, tools={})
-                        scoped = []
+                        contract = InvocationContract(
+                            decision=decision,
+                            tools={str(t.name): t for t in always},
+                        )
+                        scoped = list(always)
                     else:
                         decision = RouteDecision(
                             route="route" if scoped else "clarify",
@@ -674,7 +734,12 @@ def create_agent_app(
                             capability_ids=(explicit,) if capability else (),
                             allowed_tool_ids=tuple(str(t.name) for t in scoped),
                             registry_version=snapshot.version,
-                            memory_scopes=("user_fact", "user_preference", "task_state"),
+                            memory_scopes=(
+                                "user_fact",
+                                "user_preference",
+                                "task_state",
+                                "episodic",
+                            ),
                             reason=f"显式路由到 {explicit}",
                             audit={"path": "explicit"},
                         )
@@ -885,19 +950,32 @@ def create_agent_app(
             messages[-1] = trimmed
 
         result_state = tool_node.invoke({"messages": messages})
-        # 熔断回报：执行失败计入连续失败，成功复位
+        # 熔断回报：执行失败计入连续失败，成功复位；失败写入 episodic 记忆
         produced = result_state.get("messages", []) if isinstance(result_state, dict) else []
-        existing_ids = {str(getattr(m, "id", "")) for m in messages}
+        snapshot_now = capability_registry.snapshot()
         for message in produced:
             if getattr(message, "type", None) != "tool":
                 continue
-            content_head = str(message.content)[:1]
-            failed = content_head in {"❌", "{"} and any_tool_failure(
-                [str(message.content)]
-            )
-            gateway.record_execution(
-                str(message.name), success=not failed
-            )
+            tool_name = str(message.name)
+            failed = any_tool_failure([str(message.content)])
+            gateway.record_execution(tool_name, success=not failed)
+            if not failed:
+                continue
+            operation = snapshot_now.find_by_operation(tool_name)
+            try:
+                memory_store.add(
+                    MemoryScope.EPISODIC,
+                    f"工具 {tool_name} 执行失败：{str(message.content)[:120]}",
+                    key=f"episodic:{thread_id}:{tool_name}:{int(time.time())}",
+                    source_id="tools_node",
+                    capability_tags=(
+                        (operation.capability_id,) if operation is not None else ()
+                    ),
+                    ttl_seconds=86400,
+                    confidence=0.8,
+                )
+            except Exception:  # noqa: BLE001 - 记忆写失败不阻断工具循环
+                pass
         if rejected_messages:
             result_state["messages"] = list(produced) + rejected_messages
         return result_state
@@ -992,6 +1070,20 @@ def create_agent_app(
         decision, turn_contract, scoped_tools, scope_label = _turn_contract(
             thread_id, user_text
         )
+        # task_state 记忆生产者：当前回合任务写入结构化记忆（TTL 1 小时），
+        # 供后续回合的 Context Compiler 按能力 scope 检索
+        try:
+            memory_store.add(
+                MemoryScope.TASK_STATE,
+                f"当前任务：{user_text}",
+                key=f"task:{thread_id}",
+                source_id="agent_node",
+                capability_tags=decision.capability_ids,
+                intent_tags=(decision.intent,) if decision.intent else (),
+                ttl_seconds=3600,
+            )
+        except Exception:  # noqa: BLE001 - 记忆写失败不阻断推理
+            pass
         route_observation = _route_observation(
             user_text, actual_tools, scoped_tools
         )

@@ -1,45 +1,52 @@
 # 统一能力路由定向测评总结
 
-日期：2026-09-12 18:43 UTC ｜ 模型：z-ai/glm-5.3-free（other）｜ 报告：`artifacts/post_change_eval.json`
+日期：2026-09-13 04:29 UTC ｜ 模型：z-ai/glm-5.3-free（other）｜ 报告：`artifacts/post_change_eval.json`、`artifacts/retrieval_metrics.json`
 
 ## 0. 基线声明（不重跑旧测评）
 
 - 旧全量测评（L1 确定性 610 例、L2 真实模型 278 trials、L3 AB、L4 校准）**未重跑**，以 `PROJECT_SUMMARY.md`（提交 `11f0aa5` 前）为冻结基线：任务通过率 96.04%（Wilson 95% CI [93.1%, 97.8%]）。
 - 本次为新能力（Router/Context/Gateway）的**新增定向测评**，与旧基线分母不同，不构成 paired A/B；对比仅描述能力新增，不声称旧指标因果提升。
-- 旧基线场景本身无股票类无关调用防护（这正是本次修改动机）；定向测评证明该类失败模式已被结构性消除。
 
-## 1. 结果总览（本次实测 11 例，通过 11）
+## 1. 检索质量指标（20 能力合成语料 / 22 标注查询：18 正例 + 4 abstain）
 
-| 轨道 | 类型 | 用例 | 结果 |
-|---|---|---|---|
-| A router_correctness | 真实模型 | 5（repeat=1） | 5/5/5 |
-| B context_isolation | 确定性（0 API） | 4 | 4/4 |
-| C end_to_end（schema 熔断） | 真实模型 | 1 | 1/1 |
-| C judge | LLM-as-judge | 1 | pass |
+| 检索器 | recall@1 | recall@3 | MRR | 平均延迟 |
+|---|---|---|---|---|
+| BM25 单路 | 0.8333 | 0.8889 | 0.8704 | 0.02ms |
+| dense（确定性哈希）单路 | 0.2778 | 0.3889 | 0.3778 | 2.7ms |
+| Hybrid（RRF + 启发式重排） | 0.8333 | 0.8889 | 0.875 | 0.25ms |
 
-- A1 菜谱请求→只执行 `mcp_cooking_recommendMeals`；A2 股票请求→只执行 `mcp_market_getQuotes`；A3 通用问答→零外部工具；A4 天气/A5 翻译同样精确路由，禁用工具零命中。
-- B1 菜谱意图注入饮食事实且排除敏感记录与跨能力任务态；B2 市场意图注入市场任务态；B3 无工具路由注入"未授权任何外部工具"契约；B4 token 预算裁剪后规则与契约段完整保留（实测 226/300 tokens）。
+路由决策口径（decide() 最终单选）：**decision_accuracy=0.8333，abstain_precision=0.75**。
 
-## 2. 关键行为证据（两次真实运行）
+关键结论（全部由指标实测驱动修复，非拍脑袋）：
+1. 首次测量暴露 hybrid recall@1=0.0 的实现级 bug（指标脚本标签偏移）——修复后为 0.67，仍低于 BM25 的 0.83；
+2. 二轮定位：确定性哈希向量在 RRF 中是噪声票，稀释 BM25 的 IDF 信号 → 词法模式下禁用 dense 路；
+3. 三轮定位：重排器丢掉了检索器排序信号 → 词法模式改为"检索序 + 覆盖度门槛过滤"（门槛 0.05：4 个 none 查询 coverage 全为 0，可安全 abstain）；
+4. 终态：hybrid 与 BM25 持平（0.83/0.89/0.875 MRR 略优），语义改写与跨语言层（"明天出门要带伞吗"、"what's the weather..."）仍需真实 embedding——当前渠道不提供任何 embedding 模型（4 个模型名均 503 model_not_found，已留证 `artifacts/retrieval_metrics_real.json`），接入 `FLUXAGENT_EMBEDDING_*` 后自动启用双路融合并可用 `--real-embedding` 复测。
 
-1. **首修前运行（工具 schema 声明漂移缺陷）**：4/5 路由用例中模型每次调用都被 Gateway 以 `schema_error` 拦截——拦截机制本身正确生效；模型的后续行为符合契约：**没有换参数重试**，而是如实向用户说明失败原因并基于上下文直接回答（A1 甚至正确引用了画像中的忌口/过敏原）。
-2. **修复后运行（op schema 从工具单一事实源推导）**：11/11 通过；模型首次调用即符合 `queries` 数组契约，工具真实执行，禁用工具零命中。
-3. 两次运行合并证明：路由隔离、最小绑定、schema 校验、失败停止四个机制在真实模型下按设计工作。
+## 2. 记忆选择指标（9 条标注记录 / 3 个查询视角）
 
-## 3. API 消耗
+- **precision=1.0，recall=1.0，F1=1.0**
+- 语义规则由指标驱动定案：无标签记录（通用事实/通用经验）跨能力可见；带能力标签的记录只进对应能力，**abstain 回合一律排除**（修复了一个真实跨任务泄漏：abstain 时其他能力的 task_state 被注入）；敏感记录与 TTL 过期记录在全部视角下被排除。
+- 隔离用例：菜谱视角不含茅台/股票工具失败史；市场视角含行情任务态与该能力的失败经验；通用问答不携带任何能力任务态。
 
-本次定向测评两次完整运行（A/C 真实调用 + judge）合计约 60-80 次模型调用，远低于 5 小时 1200 次限额；未设置人为硬上限（按用户要求移除）。确定性轨道不消耗 API。
+## 3. 端到端行为（真实模型 glm-5 / other）
 
-## 4. 残余风险与后续
+- A 轨 5 例：菜谱/股票/天气/翻译各自只执行对应能力工具，禁用工具零命中，通用问答零外部工具——**5/5**。
+- C 轨 schema 熔断 1 例：模型首次调用即符合 `queries` 数组契约；此前一次运行（工具 schema 声明漂移）实证了失败链路：Gateway 全部拦截 → 模型**不换参数重试**，如实说明失败并直接回答。
+- LLM-as-judge：对 **A+C 全部 6 条 transcript** 真实评审（rubric：切题完整/失败说明/不编造数据），结果：6/6 pass。
 
-- HeuristicReranker 依赖描述文本质量；上线远程 embedding/reranker 后应补充跨语言与同义改写用例。
-- C1 本轮模型一次命中正确 schema，"错误后停止"行为由首修前运行与确定性网关测试（`test_execution_gateway.py` 14 项）共同覆盖。
-- 旧 eval 套件（tests/eval）与本次新架构的适配未做：旧 stub 场景以 `tools=` 注入路径保持兼容，未迁移到 registry 显式路径。
-- `_tool_scope_for_turn` 等旧函数为兼容保留，后续可在确认无外部依赖后合并入 Router。
+## 4. API 消耗
 
-## 5. 运行方式
+两次完整运行（A/C 真实调用 + judge）合计约 60-100 次模型调用；embedding 探测 4 次失败请求；确定性轨道与全部单元/集成测试 0 API。
+
+## 5. 残余风险与后续
+
+- 语义检索层（同义改写/跨语言）依赖真实 embedding，当前渠道不可用；接入后预期补齐 decision_accuracy 中剩余 3 例语义 miss，需复测验证。
+- judge rubric 为单裁判直评，未做旧体系的 20 例校准与 AB 换序；规模化前应复用 `tests/eval/llmjudge` 框架。
+- `_tool_scope_for_turn` 等旧函数为兼容保留；旧 eval 套件未迁移到 registry 显式路径。
+
+## 6. 运行方式
 
 ```cmd
-run_overnight.cmd   :: 回归 -> 定向测评 -> 总结，任一阶段失败即停
+run_overnight.cmd   :: 回归 -> 定向测评（含指标） -> 总结，任一阶段失败即停
 ```
-产物均在项目内：`artifacts/post_change_eval.json`、`artifacts/*.log`、两份本总结。

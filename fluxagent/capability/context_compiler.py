@@ -121,8 +121,11 @@ class MemoryStore:
                 continue
             if not include_sensitive and record.sensitivity == "sensitive":
                 continue
-            if capability_id and record.capability_tags and capability_id not in record.capability_tags:
-                continue
+            if record.capability_tags:
+                # 带能力标签的记录只进对应能力；abstain 回合（无能力）一律排除，
+                # 防止其他任务的工具上下文泄漏进通用问答
+                if not capability_id or capability_id not in record.capability_tags:
+                    continue
             if intent and record.intent_tags and intent not in record.intent_tags:
                 continue
             result.append(record)

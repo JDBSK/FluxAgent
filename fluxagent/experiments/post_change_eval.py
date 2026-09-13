@@ -17,8 +17,39 @@ import argparse
 import json
 import os
 import sys
+import time as _time
 from datetime import datetime, timezone
 from typing import Any
+
+_PACE_LOCK = __import__("threading").Lock()
+_LAST_REQUEST_AT = {"t": 0.0}
+_MIN_INTERVAL_SECONDS = 9.0  # 免费渠道常见 8 次/分钟限流，留出余量
+
+
+def _pace() -> None:
+    """全局请求节奏控制：任意 LLM 触点之间保持最小间隔。"""
+    with _PACE_LOCK:
+        elapsed = _time.monotonic() - _LAST_REQUEST_AT["t"]
+        if elapsed < _MIN_INTERVAL_SECONDS:
+            _time.sleep(_MIN_INTERVAL_SECONDS - elapsed)
+        _LAST_REQUEST_AT["t"] = _time.monotonic()
+
+
+def _invoke_with_rate_limit_retry(fn, *, attempts: int = 4):
+    """429/5xx 指数退避重试；免费渠道限流下保证任务不被单次 429 杀死。"""
+    last_exc = None
+    for attempt in range(attempts):
+        _pace()
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - 按类型决定是否退避重试
+            text = str(exc)
+            retryable = "429" in text or "RateLimit" in text or " 5" in text[:30]
+            last_exc = exc
+            if not retryable or attempt == attempts - 1:
+                raise
+            _time.sleep(min(20.0 * (attempt + 1), 60.0))
+    raise last_exc
 
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -241,10 +272,11 @@ TRACK_C_CASES = [
 ]
 
 
-def run_track_a(provider_name: str, model_name: str, repeat: int = 1) -> list[dict]:
+def run_track_a(provider_name: str, model_name: str, repeat: int = 1) -> tuple[list[dict], list[dict]]:
     from fluxagent.core.agent import create_agent_app
 
     results: list[dict] = []
+    transcripts: list[dict] = []
     for repeat_index in range(repeat):
         for case in TRACK_A_CASES:
             registry, recorded = build_synthetic_registry()
@@ -257,14 +289,16 @@ def run_track_a(provider_name: str, model_name: str, repeat: int = 1) -> list[di
             )
             recorded["calls"] = []
             try:
-                state = app.invoke(
-                    {"messages": [HumanMessage(content=case["user"])]},
-                    {"configurable": {"thread_id": f"eval-{case['id']}-{repeat_index}"}},
+                state = _invoke_with_rate_limit_retry(
+                    lambda: app.invoke(
+                        {"messages": [HumanMessage(content=case["user"])]},
+                        {"configurable": {"thread_id": f"eval-{case['id']}-{repeat_index}"}},
+                    )
                 )
                 events = _extract_events(state)
                 error = ""
             except Exception as exc:  # noqa: BLE001 - 单 case 失败不拖垮整轨
-                events = {"tool_calls": [], "final_text": ""}
+                events = {"tool_calls": [], "final_text": "", "gateway_schema_errors": 0}
                 error = str(exc)[:300]
 
             executed = {c["tool"] for c in recorded["calls"]}
@@ -288,10 +322,18 @@ def run_track_a(provider_name: str, model_name: str, repeat: int = 1) -> list[di
                     "error": error,
                 }
             )
-    return results
+            transcripts.append(
+                {
+                    "case": case["id"],
+                    "user": case["user"],
+                    "final_text": events["final_text"][:2000],
+                    "tool_calls": events["tool_calls"],
+                }
+            )
+    return results, transcripts
 
 
-# ---------- 轨道 B：上下文隔离（确定性，0 API） ----------
+# ---------- 轨道 B：上下文隔离 + 记忆选择指标 ----------
 
 def run_track_b() -> list[dict]:
     results: list[dict] = []
@@ -299,21 +341,37 @@ def run_track_b() -> list[dict]:
     store.add(MemoryScope.USER_FACT, "家庭人数：3人", key="profile.household")
     store.add(MemoryScope.USER_FACT, "过敏原：对虾过敏", key="profile.allergy")
     store.add(MemoryScope.USER_FACT, "保险柜密码 0000", key="profile.secret", sensitivity="sensitive")
+    store.add(MemoryScope.USER_PREFERENCE, "最终报告只能用中文输出", key="profile.lang")
     store.add(
-        MemoryScope.TASK_STATE,
-        "正在分析贵州茅台K线",
-        key="task.market",
+        MemoryScope.TASK_STATE, "正在分析贵州茅台K线", key="task.market",
         capability_tags=("mcp.market",),
+    )
+    store.add(
+        MemoryScope.TASK_STATE, "本周菜谱已排周一到周三", key="task.cooking",
+        capability_tags=("mcp.cooking",),
+    )
+    store.add(
+        MemoryScope.EPISODIC, "工具 mcp_market_getQuotes 曾因参数结构失败",
+        key="ep.market.schema", capability_tags=("mcp.market",), confidence=0.8,
+    )
+    store.add(
+        MemoryScope.EPISODIC, "用户曾拒绝导出聊天记录", key="ep.export.denied",
+        confidence=0.9,
+    )
+    # TTL 过期记录：不应注入
+    store.add(
+        MemoryScope.TASK_STATE, "已过期：去年圣诞菜单", key="task.expired",
+        capability_tags=("mcp.cooking",), ttl_seconds=1, now=1.0,
     )
     compiler = ContextCompiler(store, token_budget=3000)
 
-    def check(case_id, snapshot_prompt, expect_substr, forbid_substrs):
+    def check(case_id, snapshot_prompt, expect_substrs, forbid_substrs):
         results.append(
             {
                 "case": case_id,
-                "passed": expect_substr in snapshot_prompt
+                "passed": all(s in snapshot_prompt for s in expect_substrs)
                 and all(s not in snapshot_prompt for s in forbid_substrs),
-                "expect": expect_substr,
+                "expect": expect_substrs,
                 "forbidden": forbid_substrs,
             }
         )
@@ -324,37 +382,97 @@ def run_track_b() -> list[dict]:
             route="route",
             intent="recommend_meal",
             capability_ids=("mcp.cooking",),
-            memory_scopes=("user_fact", "user_preference", "task_state"),
+            memory_scopes=("user_fact", "user_preference", "task_state", "episodic"),
         )
     )
-    check("B1_cooking_gets_dietary_facts", cooking.system_prompt, "过敏原", ["保险柜", "茅台"])
+    check(
+        "B1_cooking_gets_dietary_and_cooking_state",
+        cooking.system_prompt,
+        ["过敏原", "本周菜谱已排周一到周三", "最终报告只能用中文输出", "拒绝导出聊天记录"],
+        ["保险柜", "茅台", "mcp_market_getQuotes", "已过期"],
+    )
     market = compiler.compile(
         CompilationContext(
             user_text="看盘",
             route="route",
             intent="quote_lookup",
             capability_ids=("mcp.market",),
-            memory_scopes=("user_fact", "user_preference", "task_state"),
+            memory_scopes=("user_fact", "user_preference", "task_state", "episodic"),
         )
     )
-    # 通用用户事实（无 capability 标签）按设计常驻；敏感记录必须被排除
-    check("B2_market_gets_market_task_state", market.system_prompt, "茅台", ["保险柜"])
+    check(
+        "B2_market_gets_market_state_and_episodic",
+        market.system_prompt,
+        ["茅台", "曾因参数结构失败"],
+        ["本周菜谱已排周一到周三", "保险柜"],
+    )
     general = compiler.compile(
         CompilationContext(user_text="1加1", route="answer_without_tools")
     )
     check(
         "B3_no_tool_route_contract",
         general.system_prompt,
-        "未授权任何外部工具",
+        ["未授权任何外部工具"],
         ["保险柜"],
     )
-    # 预算必须 >= 规则+契约的保底成本（约 220 tokens），否则保底段自身超限
+    # 记忆选择 precision/recall：无标签记录（通用事实/通用经验）对所有能力可见；
+    # 带能力标签的记录只进对应能力；敏感与过期一律排除
+    memory_cases = [
+        (
+            "mcp.cooking",
+            {"profile.household", "profile.allergy", "profile.lang", "task.cooking", "ep.export.denied"},
+        ),
+        (
+            "mcp.market",
+            {"profile.household", "profile.allergy", "profile.lang", "task.market", "ep.market.schema", "ep.export.denied"},
+        ),
+        (
+            None,
+            {"profile.household", "profile.allergy", "profile.lang", "ep.export.denied"},
+        ),
+    ]
+    tp = fp = fn = 0
+    per_query = []
+    for capability_id, expected_ids in memory_cases:
+        snapshot = compiler.compile(
+            CompilationContext(
+                user_text="q",
+                route="route" if capability_id else "answer_without_tools",
+                intent="",
+                capability_ids=(capability_id,) if capability_id else (),
+                memory_scopes=("user_fact", "user_preference", "task_state", "episodic"),
+            )
+        )
+        injected = {m.record_id for m in snapshot.memory}
+        tp += len(injected & expected_ids)
+        fp += len(injected - expected_ids)
+        fn += len(expected_ids - injected)
+        per_query.append(
+            {
+                "capability": capability_id or "(none)",
+                "injected": sorted(injected),
+                "expected": sorted(expected_ids),
+            }
+        )
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    results.append(
+        {
+            "case": "B4_memory_selection_prc",
+            "passed": fp == 0 and fn == 0,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "per_query": per_query,
+        }
+    )
     budgeted = ContextCompiler(store, token_budget=300).compile(
         CompilationContext(user_text="随便", history_digest="历史" * 500)
     )
     results.append(
         {
-            "case": "B4_token_budget_respected",
+            "case": "B5_token_budget_respected",
             "passed": budgeted.estimated_tokens <= 300
             and "Invocation contract" in budgeted.system_prompt
             and bool(budgeted.truncated_sections),
@@ -382,11 +500,25 @@ def run_track_c(provider_name: str, model_name: str) -> tuple[list[dict], list[d
         )
         recorded["calls"] = []
         recorded["schema_errors"] = 0
-        state = app.invoke(
-            {"messages": [HumanMessage(content=case["user"])]},
-            {"configurable": {"thread_id": f"eval-{case['id']}"}},
-        )
-        events = _extract_events(state)
+        try:
+            state = _invoke_with_rate_limit_retry(
+                lambda: app.invoke(
+                    {"messages": [HumanMessage(content=case["user"])]},
+                    {"configurable": {"thread_id": f"eval-{case['id']}"}},
+                )
+            )
+            events = _extract_events(state)
+            run_error = ""
+        except Exception as exc:  # noqa: BLE001 - 单 case 失败不拖垮整轨
+            events = {"tool_calls": [], "final_text": "", "gateway_schema_errors": 0}
+            run_error = str(exc)[:300]
+        if run_error:
+            results.append(
+                {"case": case["id"], "passed": False, "error": run_error,
+                 "gateway_schema_errors": 0, "internal_schema_errors": 0,
+                 "final_text_preview": ""}
+            )
+            continue
         schema_errors = recorded["schema_errors"] + events["gateway_schema_errors"]
         # 熔断判据：schema 错误（网关拦截 + 严格工具内部）总计有限，
         # 且最终有文字说明（模型解释失败而不是无限换参数重试）。
@@ -434,7 +566,7 @@ def judge_transcripts(provider_name: str, model_name: str, transcripts: list[dic
             + f"智能体最终回答:\n{transcript['final_text']}\n"
         )
         try:
-            response = judge.invoke(prompt)
+            response = _invoke_with_rate_limit_retry(lambda: judge.invoke(prompt))
             text = str(response.content)
             start, end = text.find("{"), text.rfind("}")
             payload = json.loads(text[start : end + 1]) if start >= 0 and end > start else {}
@@ -455,6 +587,10 @@ def main() -> int:
     parser.add_argument("--skip-real", action="store_true", help="只跑确定性轨道")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--judge", action="store_true", help="对端到端 transcript 运行 LLM-as-judge")
+    parser.add_argument(
+        "--real-embedding", action="store_true",
+        help="检索指标尝试真实 embedding 服务（需 FLUXAGENT_EMBEDDING_* 配置且渠道支持）",
+    )
     args = parser.parse_args()
 
     from dotenv import load_dotenv
@@ -479,17 +615,36 @@ def main() -> int:
     }
 
     if not args.skip_real:
+        track_a, track_a_transcripts = run_track_a(
+            provider_name, model_name, repeat=max(1, args.repeat)
+        )
         report["tracks"]["A_router_correctness"] = {
             "kind": "real_model",
-            "cases": run_track_a(provider_name, model_name, repeat=max(1, args.repeat)),
+            "cases": track_a,
         }
-        track_c, transcripts = run_track_c(provider_name, model_name)
+        track_c, track_c_transcripts = run_track_c(provider_name, model_name)
         report["tracks"]["C_end_to_end"] = {"kind": "real_model", "cases": track_c}
         if args.judge:
+            all_transcripts = track_a_transcripts + track_c_transcripts
             report["tracks"]["C_judge"] = {
                 "kind": "llm_judge",
-                "verdicts": judge_transcripts(provider_name, model_name, transcripts),
+                "transcript_count": len(all_transcripts),
+                "verdicts": judge_transcripts(provider_name, model_name, all_transcripts),
             }
+
+    # 检索质量指标：标注语料上的 recall@k / MRR / 路由决策正确率（0 API，
+    # 真实 embedding 仅在显式传入 --real-embedding 且服务可用时附加）
+    try:
+        from .retrieval_metrics import run_metrics as _run_retrieval_metrics
+
+        report["tracks"]["D_retrieval_metrics"] = {
+            "kind": "deterministic",
+            "report": _run_retrieval_metrics(
+                include_real_embedding=bool(args.real_embedding)
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 - 指标失败不掩盖主报告
+        report["tracks"]["D_retrieval_metrics"] = {"kind": "error", "error": str(exc)[:300]}
 
     os.makedirs(args.output, exist_ok=True)
     out_path = os.path.join(args.output, "post_change_eval.json")

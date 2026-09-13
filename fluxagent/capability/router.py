@@ -100,22 +100,50 @@ class Candidate:
 
 
 class HeuristicReranker:
-    """无模型重排：证据覆盖 + 反例惩罚 + 健康惩罚 + 缺槽位惩罚。
+    """无模型重排：绝对证据门槛 + RRF 排序信号 + 反例/健康/缺槽位惩罚。
 
-    显式服务于"置信度不是唯一准入"的原则：只有多信号齐备才允许 route。
+    v3 语义：
+    - 准入（evidence gate）用绝对量——查询词对全量能力卡的覆盖率；低于
+      min_coverage 的候选不可路由，全部低于则整体 abstain（防"垃圾查询
+      也给高分"的相对分陷阱）；
+    - 排序用 RRF 归一化分参与加权，不再丢弃检索器的排序信号；
+    - 能力级去重，同能力 cap/op 文档不自相拥挤。
     """
+
+    def __init__(self, min_coverage: float = 0.05, order_by: str = "blended") -> None:
+        if order_by not in {"blended", "retrieval"}:
+            raise ValueError("order_by 必须是 blended 或 retrieval")
+        self.min_coverage = min_coverage
+        # retrieval 模式：无语义第二路时，排序尊重检索器原始名次（覆盖度/惩罚
+        # 只做过滤），避免词面重打分破坏 BM25 的 IDF 排序（指标实测会掉 11 个点）
+        self.order_by = order_by
 
     def rerank(self, query: str, candidates: Sequence[Candidate]) -> List[Tuple[Candidate, float]]:
         from .retrieval import tokenize
 
+        if not candidates:
+            return []
         query_tokens = {
             token for token in tokenize(query) if len(token) >= 2 and token not in _STOPWORDS
         }
-        scored: List[Tuple[Candidate, float]] = []
+        max_fused = max(candidate.score for candidate in candidates) or 1.0
+
+        # 能力级去重：每个能力保留融合分最高的代表文档
+        best_by_capability: Dict[str, Candidate] = {}
         for candidate in candidates:
+            incumbent = best_by_capability.get(candidate.capability_id)
+            if incumbent is None or candidate.score > incumbent.score:
+                best_by_capability[candidate.capability_id] = candidate
+
+        scored: List[Tuple[Candidate, float]] = []
+        for candidate in best_by_capability.values():
             cap = candidate.capability
-            text_tokens = set(tokenize(candidate.text))
+            # 覆盖度对全量能力卡计算（含描述/意图/示例/别名），对齐 BM25 的信息面
+            text_tokens = set(tokenize(cap.searchable_text()))
             coverage = len(query_tokens & text_tokens) / max(1, len(query_tokens))
+            if coverage < self.min_coverage:
+                continue  # 证据不足：该候选不可路由
+            rrf_norm = candidate.score / max_fused
             negative_hits = sum(
                 1
                 for example in cap.negative_examples
@@ -128,8 +156,18 @@ class HeuristicReranker:
                 ProviderHealth.UNAVAILABLE: 1.0,
             }[cap.provider_health]
             missing = _missing_required_slots(candidate, query)
-            score = coverage - 0.5 * negative_hits - health_penalty - 0.1 * len(missing)
+            score = (
+                0.7 * coverage
+                + 0.3 * rrf_norm
+                - 0.5 * negative_hits
+                - health_penalty
+                - 0.1 * len(missing)
+            )
             scored.append((candidate, score))
+        if self.order_by == "retrieval":
+            # 保持 RRF 融合名次（即 BM25 名次），只保留通过门槛/惩罚的候选
+            scored.sort(key=lambda kv: (-kv[0].score, kv[0].doc_id))
+            return scored
         scored.sort(key=lambda kv: (-kv[1], kv[0].doc_id))
         return scored
 
@@ -143,6 +181,77 @@ def _significant_overlap(text_a: str, text_b: str) -> bool:
         return False
     overlap = tokens_a & tokens_b
     return len(overlap) / min(len(tokens_a), len(tokens_b)) >= 0.5
+
+
+class LLMReranker:
+    """受约束 LLM 路由重排：只看 Top-K 能力卡片，输出结构化决策。
+
+    与"把全量工具交给模型"的本质区别：这里模型只在 RRF 已召回的少数候选
+    中做受约束选择，输出 JSON；解析失败/超时/异常一律回退启发式重排并在
+    audit 中标注 fallback，绝不扩大候选集。
+    """
+
+    def __init__(self, chat_model: Any, fallback: Optional[Any] = None, timeout_seconds: float = 20.0) -> None:
+        self.chat_model = chat_model
+        self.fallback = fallback or HeuristicReranker()
+        self.timeout_seconds = timeout_seconds
+        self.last_fallback_reason = ""
+
+    def rerank(self, query: str, candidates: Sequence[Candidate]) -> List[Tuple[Candidate, float]]:
+        if not candidates:
+            return []
+        prompt = self._build_prompt(query, candidates)
+        try:
+            response = self.chat_model.invoke(prompt)
+            text = str(getattr(response, "content", response))
+            selection = self._parse_selection(text, candidates)
+            if selection is None:
+                raise ValueError("无法解析路由器 JSON 输出")
+            self.last_fallback_reason = ""
+            return selection
+        except Exception as exc:  # noqa: BLE001 - 任何 LLM 故障回退启发式，不阻断路由
+            self.last_fallback_reason = f"{type(exc).__name__}: {exc}"[:200]
+            return self.fallback.rerank(query, candidates)
+
+    @staticmethod
+    def _build_prompt(query: str, candidates: Sequence[Candidate]) -> str:
+        lines = [
+            "你是严格的能力路由器。根据用户请求，从候选能力中选择至多一个，"
+            "只在证据充分时选择；不确定必须选 none。\n",
+            f"用户请求: {query}\n",
+            "候选能力（编号|ID|描述|适用意图|输入必需槽位）:",
+        ]
+        for index, candidate in enumerate(candidates):
+            operation = candidate.operation
+            slots = ",".join(operation.required_slots) if operation else ""
+            lines.append(
+                f"{index}|{candidate.capability_id}|{candidate.text[:120]}|"
+                f"{','.join(candidate.capability.intents)}|{slots}"
+            )
+        lines.append(
+            '只输出 JSON：{"selected": <编号或-1>, "reason": "<40字内>"}'
+        )
+        return "\n".join(lines)
+
+    def _parse_selection(
+        self, text: str, candidates: Sequence[Candidate]
+    ) -> Optional[List[Tuple[Candidate, float]]]:
+        import json as _json
+
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        payload = _json.loads(text[start : end + 1])
+        selected = int(payload.get("selected", -1))
+        if selected < 0 or selected >= len(candidates):
+            return []  # 模型明确 abstain
+        ordered = [(candidates[selected], 1.0)]
+        ordered.extend(
+            (candidate, 0.5 - rank * 0.01)
+            for rank, candidate in enumerate(candidates)
+            if candidate is not candidates[selected]
+        )
+        return ordered
 
 
 def _missing_required_slots(candidate: Candidate, query: str) -> Tuple[str, ...]:
@@ -167,14 +276,22 @@ class HybridRouter:
         *,
         embedding_provider: EmbeddingProvider,
         reranker: Optional[Any] = None,
-        top_k: int = 4,
+        top_k: int = 8,
         min_rerank_score: float = 0.05,
         contract_ttl_seconds: float = 600.0,
     ) -> None:
         if top_k < 1:
             raise ValueError("top_k 必须大于 0")
         self.embedding_provider = embedding_provider
-        self.reranker = reranker or HeuristicReranker()
+        from .retrieval import DeterministicEmbedding
+
+        self.reranker = reranker or HeuristicReranker(
+            order_by=(
+                "retrieval"
+                if isinstance(embedding_provider, DeterministicEmbedding)
+                else "blended"
+            )
+        )
         self.top_k = top_k
         self.min_rerank_score = min_rerank_score
         self.contract_ttl_seconds = contract_ttl_seconds
@@ -232,6 +349,66 @@ class HybridRouter:
 
     def _bm25_knowledge_len(self) -> int:
         return len(self._docs_by_id)
+
+    # ---------- 索引持久化 ----------
+
+    def save_index(self, directory: str) -> None:
+        """按 registry 版本持久化两路索引；版本不匹配的旧文件直接覆盖。"""
+        import os
+
+        os.makedirs(directory, exist_ok=True)
+        with self._index_lock:
+            self._bm25.save(os.path.join(directory, "bm25.json"))
+            self._dense.save(os.path.join(directory, "dense.json"))
+            with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as fh:
+                import json
+
+                json.dump(
+                    {
+                        "registry_version": self._index_registry_version,
+                        "embedding_tag": self.embedding_provider.model_tag,
+                        "doc_count": len(self._docs_by_id),
+                    },
+                    fh,
+                    ensure_ascii=False,
+                )
+
+    def load_index(self, directory: str, snapshot: RegistrySnapshot) -> bool:
+        """尝试加载与当前 registry 版本和 embedding tag 匹配的持久化索引。
+
+        成功返回 True（不再重建）；版本不匹配/文件损坏返回 False（调用方
+        必须 rebuild），绝不允许旧索引配新注册表。
+        """
+        import json
+        import os
+
+        meta_path = os.path.join(directory, "meta.json")
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        if meta.get("registry_version") != snapshot.version:
+            return False
+        if meta.get("embedding_tag") != self.embedding_provider.model_tag:
+            return False
+        try:
+            bm25 = BM25Index.load(os.path.join(directory, "bm25.json"))
+            dense = DenseIndex.load(os.path.join(directory, "dense.json"))
+        except (OSError, ValueError, KeyError):
+            return False
+        with self._index_lock:
+            self._bm25 = bm25
+            self._dense = dense
+            self._index_registry_version = snapshot.version
+            # doc_id -> descriptor 映射从 snapshot 重建（描述可内存推导，无需持久化）
+            mapping: Dict[str, Tuple[CapabilityDescriptor, Optional[OperationDescriptor]]] = {}
+            for capability in snapshot.enabled_capabilities():
+                mapping[f"cap:{capability.capability_id}"] = (capability, None)
+                for operation in capability.operations:
+                    mapping[f"op:{operation.operation_id}"] = (capability, operation)
+            self._docs_by_id = mapping
+        return True
 
     # ---------- 决策 ----------
 
@@ -330,9 +507,16 @@ class HybridRouter:
             )
         try:
             bm25_ranking = self._bm25.search(text, top_k=self.top_k)
-            dense_ranking = self._dense.search(
-                text, self.embedding_provider, top_k=self.top_k
-            )
+            rankings = [bm25_ranking]
+            # 双路融合只在第二路具备真实语义信号时启用；确定性哈希向量本质
+            # 是词面信息的向量重排，参与 RRF 只会稀释 BM25 的 IDF 信号
+            # （检索指标实测：0.83→0.44），故此场景退化为单路词法检索。
+            from .retrieval import DeterministicEmbedding
+
+            if not isinstance(self.embedding_provider, DeterministicEmbedding):
+                rankings.append(
+                    self._dense.search(text, self.embedding_provider, top_k=self.top_k)
+                )
         except EmbeddingError as exc:
             return self._decision(
                 route="unavailable",
@@ -341,7 +525,7 @@ class HybridRouter:
                 reason=f"检索组件不可用: {exc}",
                 audit={"path": "hybrid", "error": str(exc)[:200]},
             )
-        fused = rrf_fuse([bm25_ranking, dense_ranking], top_k=self.top_k)
+        fused = rrf_fuse(rankings, top_k=self.top_k)
         if not fused:
             return self._decision(
                 route="answer_without_tools",
@@ -446,7 +630,7 @@ class HybridRouter:
             }
         )
         intent = capability.intents[0] if capability.intents else capability.capability_id
-        memory_scopes = ("user_fact", "user_preference", "task_state")
+        memory_scopes = ("user_fact", "user_preference", "task_state", "episodic")
         return self._decision(
             route="route",
             intent=intent,

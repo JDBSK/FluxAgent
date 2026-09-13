@@ -1,0 +1,203 @@
+# -*- coding: utf-8 -*-
+"""能力控制面加固测试：LLM 重排、索引持久化、记忆写侧、泄漏修复。"""
+from __future__ import annotations
+
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from fluxagent.capability.context_compiler import CompilationContext, ContextCompiler, MemoryScope, MemoryStore
+from fluxagent.capability.retrieval import DenseIndex, DeterministicEmbedding
+from fluxagent.capability.registry import CapabilityRegistry
+from fluxagent.capability.router import (
+    Candidate,
+    HeuristicReranker,
+    HybridRouter,
+    LLMReranker,
+)
+from tests.test_hybrid_router import make_capability
+
+
+def _candidate(capability, score, operation=None):
+    return Candidate(
+        doc_id=f"cap:{capability.capability_id}",
+        capability_id=capability.capability_id,
+        kind=capability.kind,
+        name=capability.name,
+        text=capability.searchable_text(),
+        score=score,
+        capability=capability,
+        operation=operation,
+    )
+
+
+class TestLLMReranker(unittest.TestCase):
+    def _candidates(self):
+        cooking = make_capability("cap.cooking", name="Cook", description="菜谱推荐做菜")
+        market = make_capability("cap.market", name="Market", description="股票行情走势查询")
+        return [_candidate(cooking, 0.9), _candidate(market, 0.8)]
+
+    def test_structured_selection_reorders(self):
+        chat = MagicMock()
+        chat.invoke.return_value = AIMessage(content='{"selected": 1, "reason": "股票查询"}')
+        reranker = LLMReranker(chat)
+        ranked = reranker.rerank("查询茅台股价", self._candidates())
+        self.assertEqual(ranked[0][0].capability_id, "cap.market")
+        self.assertEqual(reranker.last_fallback_reason, "")
+
+    def test_malformed_output_falls_back_to_heuristic(self):
+        chat = MagicMock()
+        chat.invoke.return_value = AIMessage(content="我觉得是第一个")
+        reranker = LLMReranker(chat)
+        ranked = reranker.rerank("推荐菜谱", self._candidates())
+        self.assertTrue(ranked)  # 回退启发式仍有结果
+        self.assertTrue(reranker.last_fallback_reason)
+
+    def test_explicit_abstain_returns_empty(self):
+        chat = MagicMock()
+        chat.invoke.return_value = AIMessage(content='{"selected": -1, "reason": "无关"}')
+        reranker = LLMReranker(chat)
+        self.assertEqual(reranker.rerank("1加1", self._candidates()), [])
+
+    def test_llm_exception_falls_back(self):
+        chat = MagicMock()
+        chat.invoke.side_effect = RuntimeError("api down")
+        reranker = LLMReranker(chat)
+        ranked = reranker.rerank("推荐菜谱", self._candidates())
+        self.assertTrue(ranked)
+        self.assertIn("RuntimeError", reranker.last_fallback_reason)
+
+
+class TestIndexPersistence(unittest.TestCase):
+    def test_save_load_roundtrip_preserves_decisions(self):
+        registry = CapabilityRegistry()
+        registry.register(make_capability("cap.alpha", name="AlphaSvc", description="菜谱推荐服务"))
+        registry.register(make_capability("cap.beta", name="BetaSvc", description="股票行情服务"))
+        snapshot = registry.snapshot()
+
+        router = HybridRouter(embedding_provider=DeterministicEmbedding(dim=128))
+        router.rebuild_index(snapshot)
+        decision_a = router.decide("推荐菜谱", snapshot)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            router.save_index(tmp)
+            router2 = HybridRouter(embedding_provider=DeterministicEmbedding(dim=128))
+            self.assertTrue(router2.load_index(tmp, snapshot))
+            decision_b = router2.decide("推荐菜谱", snapshot)
+        self.assertEqual(decision_a.capability_ids, decision_b.capability_ids)
+        self.assertEqual(decision_a.route, decision_b.route)
+
+    def test_version_mismatch_refuses_stale_index(self):
+        registry = CapabilityRegistry()
+        registry.register(make_capability("cap.alpha", name="AlphaSvc", description="菜谱推荐服务"))
+        snapshot = registry.snapshot()
+        router = HybridRouter(embedding_provider=DeterministicEmbedding(dim=128))
+        router.rebuild_index(snapshot)
+        with tempfile.TemporaryDirectory() as tmp:
+            router.save_index(tmp)
+            registry.register(make_capability("cap.new", name="NewSvc", description="翻译文本服务"))
+            snapshot2 = registry.snapshot()
+            router2 = HybridRouter(embedding_provider=DeterministicEmbedding(dim=128))
+            self.assertFalse(router2.load_index(tmp, snapshot2))
+
+    def test_embedding_tag_mismatch_refuses(self):
+        registry = CapabilityRegistry()
+        registry.register(make_capability("cap.alpha", name="AlphaSvc", description="菜谱推荐服务"))
+        snapshot = registry.snapshot()
+        router = HybridRouter(embedding_provider=DeterministicEmbedding(dim=128))
+        router.rebuild_index(snapshot)
+        with tempfile.TemporaryDirectory() as tmp:
+            router.save_index(tmp)
+            router2 = HybridRouter(embedding_provider=DeterministicEmbedding(dim=64))
+            self.assertFalse(router2.load_index(tmp, snapshot))
+
+
+class TestHeuristicRerankerOrders(unittest.TestCase):
+    def test_retrieval_order_preserves_fused_rank(self):
+        alpha = make_capability("cap.alpha", name="A", description="通用数据服务 alpha 内容")
+        beta = make_capability("cap.beta", name="B", description="另一服务 beta 内容")
+        # fused 分数：alpha 0.9 > beta 0.5，但 blended（覆盖度主导）可能反转
+        reranker = HeuristicReranker(order_by="retrieval")
+        ranked = reranker.rerank("通用 数据 服务", [_candidate(alpha, 0.9), _candidate(beta, 0.5)])
+        self.assertEqual(ranked[0][0].capability_id, "cap.alpha")
+
+    def test_invalid_order_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            HeuristicReranker(order_by="bogus")
+
+
+class TestMemoryWriteSide(unittest.TestCase):
+    def test_agent_writes_task_state_and_episodic_memory(self):
+        from fluxagent.capability.providers import builtin_descriptors
+        from fluxagent.core.agent import create_agent_app
+        from fluxagent.core.tools.builtins import BUILTIN_TOOLS
+
+        registry = CapabilityRegistry()
+        for descriptor in builtin_descriptors(BUILTIN_TOOLS):
+            registry.register(descriptor)
+        store = MemoryStore()
+
+        parent = MagicMock()
+        parent.bind_tools.return_value = parent
+        parent.invoke.side_effect = [
+            AIMessage(content="", tool_calls=[
+                {"name": "calculator", "args": {"expression": "1+", "value": ""}, "id": "c1"}
+            ]),
+            AIMessage(content="计算失败了，如实说明"),
+        ] + [AIMessage(content="兜底")] * 10
+
+        with patch("fluxagent.core.agent.get_provider", return_value=parent), \
+             patch("fluxagent.core.agent.MEMORY_DIR", tempfile.mkdtemp()):
+            app = create_agent_app(
+                capability_registry=registry,
+                memory_store=store,
+                enable_planner=False,
+                require_approval=False,
+            )
+            app.invoke(
+                {"messages": [HumanMessage(content="帮我算一下 1+")]},
+                {"configurable": {"thread_id": "mem-test"}},
+            )
+
+        record_ids = {r.record_id for r in store.all_records()}
+        # task_state 生产者：当前回合任务已写入
+        self.assertIn("task:mem-test", record_ids)
+        # episodic 生产者：工具失败已写入（calculator 对非法表达式返回失败）
+        episodic = [r for r in store.all_records() if r.record_id.startswith("episodic:")]
+        self.assertTrue(episodic, "工具失败应写入 episodic 记忆")
+
+    def test_tagged_memory_excluded_from_abstain_turns(self):
+        """跨任务泄漏回归：abstain 回合不得看到其他能力的带标签记忆。"""
+        store = MemoryStore()
+        store.add(
+            MemoryScope.TASK_STATE, "正在分析茅台", key="task.market",
+            capability_tags=("mcp.market",),
+        )
+        store.add(MemoryScope.USER_FACT, "通用事实", key="profile.generic")
+        compiler = ContextCompiler(store, token_budget=4000)
+        snapshot = compiler.compile(
+            CompilationContext(user_text="1加1", route="answer_without_tools")
+        )
+        self.assertNotIn("茅台", snapshot.system_prompt)
+        self.assertIn("通用事实", snapshot.system_prompt)
+
+
+class TestDenseIndexRoundtrip(unittest.TestCase):
+    def test_save_load_with_text_payloads(self):
+        provider = DeterministicEmbedding(dim=64)
+        index = DenseIndex()
+        index.rebuild([("d1", "股票行情查询"), ("d2", "菜谱推荐")], provider)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/dense.json"
+            index.save(path)
+            loaded = DenseIndex.load(path)
+            self.assertEqual(
+                index.search("股票 行情", provider, top_k=2),
+                loaded.search("股票 行情", provider, top_k=2),
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
