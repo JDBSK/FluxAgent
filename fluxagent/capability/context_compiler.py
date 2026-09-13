@@ -44,6 +44,9 @@ class MemoryRecord:
     intent_tags: Tuple[str, ...] = ()
     sensitivity: str = "normal"
     confidence: float = 1.0
+    # 会话归属：空串 = 全局记录（画像/通用偏好）；非空 = 仅本会话可见。
+    # 这是跨会话数据边界的硬边界：会话 A 的任务态/失败经验不得进入会话 B。
+    session_id: str = ""
 
     def __post_init__(self) -> None:
         if self.sensitivity not in SENSITIVITY_LEVELS:
@@ -80,11 +83,23 @@ class MemoryStore:
         intent_tags: Sequence[str] = (),
         sensitivity: str = "normal",
         confidence: float = 1.0,
+        session_id: str = "",
         now: Optional[float] = None,
     ) -> MemoryRecord:
+        if "@@" in str(key or "") or "@@" in str(session_id or ""):
+            # fail-closed：@@ 是会话命名空间分隔符，出现即拒绝，
+            # 防止 (key="k@@a", session="b") 与 (key="k", session="a@@b") 碰撞
+            raise ValueError('memory key/session_id 不允许包含 "@@"')
         with self._lock:
             self._counter += 1
-            record_id = key or f"mem-{self._counter}"
+            # record_id 含 scope 前缀 + 会话命名空间：同 key 跨 scope 不互相覆盖，
+            # 不同会话写同名 key 不互相覆盖
+            if key and session_id:
+                record_id = f"{scope.value}:{key}@@{session_id}"
+            elif key:
+                record_id = f"{scope.value}:{key}"
+            else:
+                record_id = f"mem-{self._counter}"
             record = MemoryRecord(
                 record_id=record_id,
                 scope=scope,
@@ -97,6 +112,7 @@ class MemoryStore:
                 intent_tags=tuple(intent_tags),
                 sensitivity=sensitivity,
                 confidence=confidence,
+                session_id=str(session_id or ""),
             )
             self._records[record_id] = record
             return record
@@ -106,25 +122,57 @@ class MemoryStore:
         *,
         scopes: Optional[Sequence[MemoryScope]] = None,
         capability_id: Optional[str] = None,
+        capability_ids: Optional[Sequence[str]] = None,
         intent: Optional[str] = None,
         include_sensitive: bool = False,
+        session_id: Optional[str] = None,
         now: Optional[float] = None,
     ) -> List[MemoryRecord]:
-        """按 scope + capability/intent 相关性筛选；敏感记录默认排除。"""
+        """按 scope + capability/intent 相关性 + 会话边界筛选；敏感记录默认排除。
+
+        会话边界（fail-closed）：
+        - 全局记录（session_id 为空，如画像/通用偏好）任何会话可见；
+        - 会话级记录只在 session_id 完全一致时可见；调用方未提供会话上下文
+          （session_id=None）时会话级记录一律排除，防止跨会话泄漏。
+        """
         with self._lock:
             candidates = list(self._records.values())
+            # 惰性驱逐：过期记录在查询时清理，防止长驻进程内存无界增长。
+            # 锁内重验再删（防 TOCTOU 误删并发覆盖写的新记录）；
+            # 仅墙钟驱动（now=None）——传入历史时间戳的回放不得破坏全局状态
+            if now is None:
+                expired_ids = {
+                    record.record_id
+                    for record in candidates
+                    if record.is_expired(None)
+                }
+                for record_id in expired_ids:
+                    record = self._records.get(record_id)
+                    if record is not None and record.is_expired(None):
+                        del self._records[record_id]
+            else:
+                expired_ids = {
+                    record.record_id for record in candidates if record.is_expired(now)
+                }
         result: List[MemoryRecord] = []
         for record in candidates:
-            if record.is_expired(now):
+            if record.record_id in expired_ids:
                 continue
             if scopes is not None and record.scope not in scopes:
                 continue
             if not include_sensitive and record.sensitivity == "sensitive":
                 continue
+            if record.session_id:
+                if session_id is None or record.session_id != session_id:
+                    continue
             if record.capability_tags:
-                # 带能力标签的记录只进对应能力；abstain 回合（无能力）一律排除，
+                # 带能力标签的记录只进对应能力（多能力回合按交集判断）；
+                # abstain 回合（无能力）一律排除，
                 # 防止其他任务的工具上下文泄漏进通用问答
-                if not capability_id or capability_id not in record.capability_tags:
+                allowed = set(capability_ids or ()) or (
+                    {capability_id} if capability_id else set()
+                )
+                if not allowed or not (allowed & set(record.capability_tags)):
                     continue
             if intent and record.intent_tags and intent not in record.intent_tags:
                 continue
@@ -236,6 +284,11 @@ class CompilationContext:
     task_state: str = ""
     skill_context: str = ""
     failure_facts: Tuple[str, ...] = ()
+    # 会话上下文：为空时编译器排除所有会话级记忆（fail-closed 数据边界）
+    session_id: str = ""
+    # 本回合实际绑定的工具名（渲染进契约块，避免提示与机制不一致）
+    allowed_tool_names: Tuple[str, ...] = ()
+    skill_is_context_only: bool = False
 
 
 class ContextCompiler:
@@ -255,6 +308,8 @@ class ContextCompiler:
     ) -> None:
         if token_budget < 64:
             raise ValueError("token_budget 过小")
+        if max_skill_context_tokens < 64:
+            raise ValueError("max_skill_context_tokens 过小")
         self.memory_store = memory_store
         self.token_budget = token_budget
         self.tokenizer = tokenizer or estimate_tokens
@@ -271,9 +326,10 @@ class ContextCompiler:
         scopes = self._scopes_for(context.memory_scopes)
         records = self.memory_store.query(
             scopes=scopes,
-            capability_id=context.capability_ids[0] if context.capability_ids else None,
+            capability_ids=context.capability_ids or None,
             intent=context.intent or None,
             include_sensitive=include_sensitive,
+            session_id=context.session_id if context.session_id else None,
             now=now,
         )
 
@@ -359,7 +415,7 @@ class ContextCompiler:
             return text, False
         # 保守按字符比例截断，保留头尾以维持可用性
         ratio = budget_tokens / max(1, self.tokenizer(text))
-        keep = max(200, int(len(text) * ratio * 0.9))
+        keep = max(64, min(int(len(text) * ratio * 0.9), len(text)))
         head = text[: keep // 2]
         tail = text[-keep // 2 :]
         return head + "\n...[截断]...\n" + tail, True
@@ -383,9 +439,18 @@ class ContextCompiler:
         lines = [f"[Invocation contract] route={context.route}"]
         if context.capability_ids:
             lines.append(f"allowed_capabilities={','.join(context.capability_ids)}")
+        if context.allowed_tool_names:
+            shown = ", ".join(context.allowed_tool_names[:12])
+            more = " ..." if len(context.allowed_tool_names) > 12 else ""
+            lines.append(f"allowed_tools={shown}{more}")
+        if context.skill_is_context_only:
+            lines.append(
+                "选中的 Skill 以本提示中的上下文注入，不产生任何工具调用；"
+                "请基于其内容直接回答。"
+            )
         if context.route != "route":
             lines.append(
-                "本回合未授权任何外部工具；请基于上下文直接回答，"
-                "或向用户澄清需要哪个能力。"
+                "本回合未授权任何外部能力工具（内置本地工具仍可用）；"
+                "请基于上下文直接回答，或向用户澄清需要哪个能力。"
             )
         return "\n".join(lines)

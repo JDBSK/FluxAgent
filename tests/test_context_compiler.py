@@ -124,7 +124,7 @@ class TestContextCompiler(unittest.TestCase):
         self.assertIn("过敏原：对虾过敏", values)
         self.assertIn("最终报告只能用中文输出", values)
         reasons = {m.record_id: m.reason for m in snapshot.memory}
-        self.assertIn("scope=user_fact", reasons["profile.household"])
+        self.assertIn("scope=user_fact", reasons["user_fact:profile.household"])
         self.assertNotIn("项目密码本位置：保险柜", snapshot.system_prompt)
 
     def test_sensitive_memory_excluded_by_default(self):
@@ -171,7 +171,7 @@ class TestContextCompiler(unittest.TestCase):
             CompilationContext(user_text="1加1等于几", route="answer_without_tools")
         )
         self.assertIn("route=answer_without_tools", snapshot.system_prompt)
-        self.assertIn("未授权任何外部工具", snapshot.system_prompt)
+        self.assertIn("未授权任何外部能力工具", snapshot.system_prompt)
 
     def test_token_budget_truncates_low_priority_sections(self):
         store = MemoryStore()

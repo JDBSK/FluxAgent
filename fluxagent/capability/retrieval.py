@@ -35,6 +35,9 @@ def tokenize(text: str) -> List[str]:
             tokens.append(run)
             continue
         tokens.append(run)
+        if len(run) == 2:
+            # 2 字 run 的 bigram 与整词相同，重复计入会使该词 tf 翻倍
+            continue
         tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
     return tokens
 
@@ -59,6 +62,7 @@ class BM25Index:
         self._postings: Dict[str, Dict[str, float]] = {}
         self._doc_len: Dict[str, float] = {}
         self._avg_len: float = 0.0
+        self._header: Mapping = {}
 
     def rebuild(self, documents: Iterable[Document]) -> None:
         with self._lock:
@@ -102,25 +106,25 @@ class BM25Index:
 
     # ---------- 持久化 ----------
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, header: Optional[Mapping] = None) -> None:
         with self._lock:
             payload = {
                 "k1": self.k1,
                 "b": self.b,
+                "header": dict(header or {}),
                 "docs": [
                     {"doc_id": d.doc_id, "text": d.text, "payload": dict(d.payload)}
                     for d in self._docs.values()
                 ],
             }
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
+        _atomic_write_json(path, payload)
 
     @classmethod
     def load(cls, path: str) -> "BM25Index":
         with open(path, encoding="utf-8") as fh:
             payload = json.load(fh)
         index = cls(k1=payload.get("k1", 1.5), b=payload.get("b", 0.75))
+        index._header = dict(payload.get("header", {}))
         index.rebuild(
             Document(d["doc_id"], d["text"], d.get("payload", {})) for d in payload["docs"]
         )
@@ -210,6 +214,7 @@ class DenseIndex:
         self._payloads: Dict[str, Mapping] = {}
         self._vectors: Dict[str, List[float]] = {}
         self.model_tag: str = ""
+        self._header: Mapping = {}
 
     def rebuild(
         self, items: Sequence[Tuple[str, Mapping]], provider: EmbeddingProvider
@@ -238,10 +243,11 @@ class DenseIndex:
             scored.sort(key=lambda kv: (-kv[1], kv[0]))
             return scored[:top_k]
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, header: Optional[Mapping] = None) -> None:
         with self._lock:
             payload = {
                 "model_tag": self.model_tag,
+                "header": dict(header or {}),
                 "items": [
                     {
                         "doc_id": doc_id,
@@ -251,9 +257,7 @@ class DenseIndex:
                     for doc_id in self._ids
                 ],
             }
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
+        _atomic_write_json(path, payload)
 
     @classmethod
     def load(cls, path: str) -> "DenseIndex":
@@ -261,6 +265,7 @@ class DenseIndex:
             payload = json.load(fh)
         index = cls()
         index.model_tag = payload.get("model_tag", "")
+        index._header = dict(payload.get("header", {}))
         index._ids = [item["doc_id"] for item in payload["items"]]
         index._payloads = {item["doc_id"]: str(item.get("payload", "")) for item in payload["items"]}
         index._vectors = {item["doc_id"]: list(item["vector"]) for item in payload["items"]}
@@ -274,6 +279,15 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     na = math.sqrt(sum(x * x for x in a)) or 1.0
     nb = math.sqrt(sum(y * y for y in b)) or 1.0
     return dot / (na * nb)
+
+
+def _atomic_write_json(path: str, payload: Mapping) -> None:
+    """临时文件 + os.replace 原子写，避免多进程读到半截索引。"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+    os.replace(temp_path, path)
 
 
 # ---------- 融合 ----------

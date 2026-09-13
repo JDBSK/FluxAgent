@@ -576,7 +576,9 @@ def create_agent_app(
                 provider_name=os.getenv("DEFAULT_PROVIDER", "aliyun"),
                 model_name=_router_model,
             )
-            _router.reranker = LLMReranker(_router_chat)
+            # fallback 接线：LLM 故障回退到与主 reranker 同配置的启发式，
+            # 而不是裸默认实例（覆盖度门槛/排序模式保持一致）
+            _router.reranker = LLMReranker(_router_chat, fallback=_router.reranker)
             audit_logger.log_event(
                 thread_id="system_default",
                 event="system_action",
@@ -590,9 +592,9 @@ def create_agent_app(
                 action="router_llm_reranker_failed",
                 error=str(exc)[:200],
             )
-    # 索引持久化：registry 版本 + embedding tag 双重匹配才复用，否则重建并落盘。
-    # 目录锚定在 MEMORY_DIR 内——测试把 MEMORY_DIR patch 到临时目录时，
-    # 持久化文件仍严格留在允许的目录边界内。
+    # 索引持久化：registry 版本 + embedding tag + 索引格式版本三重匹配才复用，
+    # 否则重建并落盘。目录锚定在 MEMORY_DIR 内——测试把 MEMORY_DIR patch 到
+    # 临时目录时，持久化文件仍严格留在允许的目录边界内。
     _index_dir = os.path.join(MEMORY_DIR, "capability_index")
     if not _router.load_index(_index_dir, capability_registry.snapshot()):
         _router.rebuild_index(capability_registry.snapshot())
@@ -605,7 +607,6 @@ def create_agent_app(
                 action="capability_index_persist_failed",
                 error=str(exc)[:200],
             )
-    _router.rebuild_index(capability_registry.snapshot())
 
     if memory_store is None:
         memory_store = MemoryStore()
@@ -653,7 +654,7 @@ def create_agent_app(
     def _match_capability_explicit(
         user_text: str, snapshot: RegistrySnapshot
     ) -> Optional[str]:
-        """在 Registry 别名上做显式匹配（语义与 _explicit_tool_scope 一致）。
+        """在 Registry 别名上做显式匹配（仅外部能力；builtin 永远常驻不是路由目标）。
 
         返回 capability_id；"" 表示显式信号存在但无法唯一解析（fail closed）；
         None 表示没有显式路由信号，应走 Hybrid 检索。
@@ -661,6 +662,10 @@ def create_agent_app(
         text = str(user_text or "").casefold()
         alias_map: dict[str, set[str]] = {}
         for capability in snapshot.enabled_capabilities():
+            if capability.kind == "builtin":
+                # builtin 的工具名碎片（save/time/run/write…）是普通英文词，
+                # 参与显式匹配会让任意请求"显式路由"到单个内置工具
+                continue
             terms: set[str] = set()
             for source in (capability.capability_id, capability.name, *capability.aliases):
                 terms.update(_metadata_aliases(source))
@@ -684,110 +689,130 @@ def create_agent_app(
         return None
 
     def _turn_contract(
-        thread_id: str, user_text: str
+        thread_id: str, user_text: str, *, force_refresh: bool = False
     ) -> tuple[RouteDecision, InvocationContract, list[BaseTool], str]:
-        """解析本回合的最小工具集合；同一用户回合内缓存复用。"""
+        """解析本回合的最小工具集合；同一用户回合内缓存复用。
+
+        缓存命中时对契约做滑动续期：审批等待或长回合超过 TTL 不应让已授权
+        的调用被拒（registry 版本变化仍有独立校验兜底，续期不削弱 fail-closed）。
+        重算不持锁——LLM 重排/远程 embedding 可能阻塞，锁只保护缓存读写。
+        """
+        snapshot = capability_registry.snapshot()
         with _router_lock:
             cached = _turn_scopes.get(thread_id)
-            if cached and cached[0] == user_text:
-                return cached[1], cached[2], cached[3], cached[4]
+        if (
+            not force_refresh
+            and cached
+            and cached[0] == user_text
+            and not cached[2].is_expired()
+            and cached[2].decision.registry_version == snapshot.version
+        ):
+            cached[2].created_at = time.time()  # 滑动续期
+            return cached[1], cached[2], cached[3], cached[4]
 
-            snapshot = capability_registry.snapshot()
-            explicit = _match_capability_explicit(user_text, snapshot)
-            always = _always_tools()
-            if explicit is not None:
-                if explicit:
-                    capability = snapshot.get(explicit)
-                    operations = list(capability.operations) if capability else []
-                    scoped = [
-                        op.tool for op in operations if op.tool is not None
-                    ]
-                    scoped = _dedupe_tools(scoped)
-                    label = explicit
-                    if capability is not None and capability.kind == "prompt_skill":
-                        # Prompt Skill：零外部工具，只注入受限上下文；
-                        # 常驻 builtin 工具并入契约，保持本地动作可用
-                        decision = RouteDecision(
-                            route="route",
-                            intent=capability.intents[0] if capability.intents else explicit,
-                            capability_ids=(explicit,),
-                            allowed_tool_ids=tuple(str(t.name) for t in always),
-                            registry_version=snapshot.version,
-                            memory_scopes=(
-                                "user_fact",
-                                "user_preference",
-                                "task_state",
-                                "skill_context",
-                            ),
-                            reason=f"显式路由到 Prompt Skill {explicit}",
-                            audit={"path": "explicit", "kind": "prompt_skill"},
-                        )
-                        contract = InvocationContract(
-                            decision=decision,
-                            tools={str(t.name): t for t in always},
-                        )
-                        scoped = list(always)
-                    else:
-                        decision = RouteDecision(
-                            route="route" if scoped else "clarify",
-                            intent=explicit,
-                            capability_ids=(explicit,) if capability else (),
-                            allowed_tool_ids=tuple(str(t.name) for t in scoped),
-                            registry_version=snapshot.version,
-                            memory_scopes=(
-                                "user_fact",
-                                "user_preference",
-                                "task_state",
-                                "episodic",
-                            ),
-                            reason=f"显式路由到 {explicit}",
-                            audit={"path": "explicit"},
-                        )
-                        contract = InvocationContract(
-                            decision=decision,
-                            tools={str(t.name): t for t in scoped},
-                        )
-                else:
-                    label = _explicit_backend_hint(user_text) or "explicit_unresolved"
+        # 重算阶段不持锁：LLM 重排/远程 embedding 可能长时间阻塞，
+        # 锁只保护缓存读写；并发重算幂等，后写覆盖。
+        explicit = _match_capability_explicit(user_text, snapshot)
+        always = _always_tools()
+        if explicit is not None:
+            if explicit:
+                capability = snapshot.get(explicit)
+                operations = list(capability.operations) if capability else []
+                external_tools = [
+                    op.tool for op in operations if op.tool is not None
+                ]
+                label = explicit
+                if capability is not None and capability.kind == "prompt_skill":
+                    # Prompt Skill：零外部工具，只注入受限上下文；
+                    # 常驻 builtin 工具并入契约，保持本地动作可用
                     decision = RouteDecision(
-                        route="clarify",
-                        intent="explicit_backend_unresolved",
+                        route="route",
+                        intent=capability.intents[0] if capability.intents else explicit,
+                        capability_ids=(explicit,),
+                        allowed_tool_ids=tuple(str(t.name) for t in always),
                         registry_version=snapshot.version,
-                        reason="显式指定的能力无法唯一解析或未注册",
-                        audit={"path": "explicit", "requested": label},
+                        memory_scopes=(
+                            "user_fact",
+                            "user_preference",
+                            "task_state",
+                            "skill_context",
+                        ),
+                        reason=f"显式路由到 Prompt Skill {explicit}",
+                        audit={"path": "explicit", "kind": "prompt_skill"},
                     )
-                    contract = InvocationContract(decision=decision, tools={})
-                    scoped = []
+                    contract = InvocationContract(
+                        decision=decision,
+                        tools={str(t.name): t for t in always},
+                    )
+                    scoped = list(always)
+                else:
+                    # 可执行能力：常驻 builtin 并入契约，与 hybrid 分支语义一致；
+                    # 否则模型按系统规则调用 save_user_profile 等会被必然 policy_block
+                    scoped = _dedupe_tools(list(always) + external_tools)
+                    decision = RouteDecision(
+                        route="route" if external_tools else "clarify",
+                        intent=explicit,
+                        capability_ids=(explicit,) if capability else (),
+                        allowed_tool_ids=tuple(str(t.name) for t in scoped),
+                        registry_version=snapshot.version,
+                        memory_scopes=(
+                            "user_fact",
+                            "user_preference",
+                            "task_state",
+                            "episodic",
+                        ),
+                        reason=f"显式路由到 {explicit}",
+                        audit={"path": "explicit"},
+                    )
+                    contract = InvocationContract(
+                        decision=decision,
+                        tools={str(t.name): t for t in scoped},
+                    )
             else:
-                decision = _router.decide(user_text, snapshot)
-                contract = _router.build_contract(decision, snapshot)
-                label = ""
-                # 常驻 builtin 工具并入契约：路由只决定"外部能力"的最小集合，
-                # 本地动作（时间/计算/文件读写等）始终可用且必须过同一网关。
-                merged_tools: dict[str, BaseTool] = {
-                    str(tool.name): tool for tool in always
-                }
-                merged_tools.update(contract.tools)
+                label = _explicit_backend_hint(user_text) or "explicit_unresolved"
                 decision = RouteDecision(
-                    route=decision.route,
-                    intent=decision.intent,
-                    capability_ids=decision.capability_ids,
-                    operation_ids=decision.operation_ids,
-                    allowed_tool_ids=tuple(merged_tools.keys()),
-                    evidence_ids=decision.evidence_ids,
-                    missing_slots=decision.missing_slots,
-                    memory_scopes=decision.memory_scopes,
-                    registry_version=decision.registry_version,
-                    index_version=decision.index_version,
-                    reason=decision.reason,
-                    audit=decision.audit,
+                    route="clarify",
+                    intent="explicit_backend_unresolved",
+                    registry_version=snapshot.version,
+                    reason="显式指定的能力无法唯一解析或未注册",
+                    audit={"path": "explicit", "requested": label},
                 )
-                contract = InvocationContract(decision=decision, tools=merged_tools)
-                scoped = list(merged_tools.values())
+                contract = InvocationContract(decision=decision, tools={})
+                scoped = []
+        else:
+            decision = _router.decide(user_text, snapshot)
+            contract = _router.build_contract(decision, snapshot)
+            label = ""
+            # 常驻 builtin 工具并入契约：路由只决定"外部能力"的最小集合，
+            # 本地动作（时间/计算/文件读写等）始终可用且必须过同一网关。
+            merged_tools: dict[str, BaseTool] = {
+                str(tool.name): tool for tool in always
+            }
+            merged_tools.update(contract.tools)
+            decision = RouteDecision(
+                route=decision.route,
+                intent=decision.intent,
+                capability_ids=decision.capability_ids,
+                operation_ids=decision.operation_ids,
+                allowed_tool_ids=tuple(merged_tools.keys()),
+                evidence_ids=decision.evidence_ids,
+                missing_slots=decision.missing_slots,
+                memory_scopes=decision.memory_scopes,
+                registry_version=decision.registry_version,
+                index_version=decision.index_version,
+                reason=decision.reason,
+                audit=decision.audit,
+            )
+            contract = InvocationContract(decision=decision, tools=merged_tools)
+            scoped = list(merged_tools.values())
 
-            scoped = _dedupe_tools(scoped)
+        scoped = _dedupe_tools(scoped)
+        with _router_lock:
             _turn_scopes[thread_id] = (user_text, decision, contract, scoped, label)
-            return decision, contract, scoped, label
+            # 容量上限：被放弃的会话（审批未恢复等）不无限泄漏
+            while len(_turn_scopes) > 256:
+                _turn_scopes.pop(next(iter(_turn_scopes)))
+        return decision, contract, scoped, label
 
     def _gateway_for(thread_id: str, user_text: str) -> ExecutionGateway:
         """本回合执行网关：契约 + 注册表快照 + 共享熔断器。"""
@@ -808,8 +833,10 @@ def create_agent_app(
             _turn_scopes.pop(thread_id, None)
         # 新用户回合重新读取画像：save_user_profile 的写入立即对下一回合生效
         try:
+            # record_id 带 scope 前缀（如 user_fact:profile.household），
+            # 按画像命名空间子串匹配
             for record in memory_store.all_records():
-                if record.record_id.startswith("profile."):
+                if "profile." in record.record_id:
                     memory_store.forget(record.record_id)
             ProfileCompatProvider(os.path.join(MEMORY_DIR, "user_profile.md")).load_into(
                 memory_store
@@ -973,6 +1000,7 @@ def create_agent_app(
                     ),
                     ttl_seconds=86400,
                     confidence=0.8,
+                    session_id=thread_id,
                 )
             except Exception:  # noqa: BLE001 - 记忆写失败不阻断工具循环
                 pass
@@ -1070,20 +1098,6 @@ def create_agent_app(
         decision, turn_contract, scoped_tools, scope_label = _turn_contract(
             thread_id, user_text
         )
-        # task_state 记忆生产者：当前回合任务写入结构化记忆（TTL 1 小时），
-        # 供后续回合的 Context Compiler 按能力 scope 检索
-        try:
-            memory_store.add(
-                MemoryScope.TASK_STATE,
-                f"当前任务：{user_text}",
-                key=f"task:{thread_id}",
-                source_id="agent_node",
-                capability_tags=decision.capability_ids,
-                intent_tags=(decision.intent,) if decision.intent else (),
-                ttl_seconds=3600,
-            )
-        except Exception:  # noqa: BLE001 - 记忆写失败不阻断推理
-            pass
         route_observation = _route_observation(
             user_text, actual_tools, scoped_tools
         )
@@ -1231,6 +1245,11 @@ def create_agent_app(
                 history_digest=active_summary or "",
                 failure_facts=failure_facts,
                 skill_context=skill_context,
+                session_id=thread_id,
+                allowed_tool_names=tuple(str(t.name) for t in scoped_tools),
+                skill_is_context_only=bool(
+                    skill_context and not decision.allowed_tool_ids
+                ),
             )
         )
         audit_logger.log_event(
@@ -1242,6 +1261,23 @@ def create_agent_app(
             estimated_tokens=compiled.estimated_tokens,
             truncated=list(compiled.truncated_sections),
         )
+
+        # task_state 记忆生产者：在 compile 之后写入（本回合不自我注入），
+        # 且仅在外部能力被路由时记录——abstain 回合不产生任务态污染
+        if decision.route == "route":
+            try:
+                memory_store.add(
+                    MemoryScope.TASK_STATE,
+                    f"当前任务：{user_text}",
+                    key=f"task:{thread_id}",
+                    source_id="agent_node",
+                    capability_tags=decision.capability_ids,
+                    intent_tags=(decision.intent,) if decision.intent else (),
+                    ttl_seconds=3600,
+                    session_id=thread_id,
+                )
+            except Exception:  # noqa: BLE001 - 记忆写失败不阻断推理
+                pass
 
         sys_prompt = compiled.system_prompt
         sys_prompt += (

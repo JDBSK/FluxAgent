@@ -35,21 +35,39 @@ def _pace() -> None:
         _LAST_REQUEST_AT["t"] = _time.monotonic()
 
 
-def _invoke_with_rate_limit_retry(fn, *, attempts: int = 4):
-    """429/5xx 指数退避重试；免费渠道限流下保证任务不被单次 429 杀死。"""
-    last_exc = None
+def _is_retryable_error(exc: Exception) -> bool:
+    """按 status_code 与大小写不敏感关键词判断是否限流/服务端瞬断。"""
+    import re as _re
+
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and (status == 429 or 500 <= status < 600):
+        return True
+    text = str(exc)
+    if _re.search(r"(429|5\d{2})", text):
+        return True
+    lowered = text.casefold()
+    return "rate limit" in lowered or "ratelimit" in lowered or "throttl" in lowered
+
+
+def _invoke_with_rate_limit_retry(fn, *, attempts: int = 4, on_retry=None):
+    """429/5xx 指数退避重试；免费渠道限流下保证任务不被单次 429 杀死。
+
+    on_retry 在每次重试前调用（用于重置被捕获的计数状态，防止跨尝试污染）。
+    """
     for attempt in range(attempts):
         _pace()
         try:
             return fn()
         except Exception as exc:  # noqa: BLE001 - 按类型决定是否退避重试
-            text = str(exc)
-            retryable = "429" in text or "RateLimit" in text or " 5" in text[:30]
-            last_exc = exc
-            if not retryable or attempt == attempts - 1:
+            if not _is_retryable_error(exc) or attempt == attempts - 1:
                 raise
+            if on_retry is not None:
+                try:
+                    on_retry()
+                except Exception:  # noqa: BLE001
+                    pass
             _time.sleep(min(20.0 * (attempt + 1), 60.0))
-    raise last_exc
+    raise RuntimeError("unreachable")
 
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -293,7 +311,8 @@ def run_track_a(provider_name: str, model_name: str, repeat: int = 1) -> tuple[l
                     lambda: app.invoke(
                         {"messages": [HumanMessage(content=case["user"])]},
                         {"configurable": {"thread_id": f"eval-{case['id']}-{repeat_index}"}},
-                    )
+                    ),
+                    on_retry=lambda: recorded.update(calls=[], schema_errors=0),
                 )
                 events = _extract_events(state)
                 error = ""
@@ -412,23 +431,33 @@ def run_track_b() -> list[dict]:
     check(
         "B3_no_tool_route_contract",
         general.system_prompt,
-        ["未授权任何外部工具"],
+        ["未授权任何外部能力工具"],
         ["保险柜"],
     )
     # 记忆选择 precision/recall：无标签记录（通用事实/通用经验）对所有能力可见；
     # 带能力标签的记录只进对应能力；敏感与过期一律排除
+    # record_id 带 scope 前缀（user_fact:/task_state:/episodic:）
     memory_cases = [
         (
             "mcp.cooking",
-            {"profile.household", "profile.allergy", "profile.lang", "task.cooking", "ep.export.denied"},
+            {
+                "user_fact:profile.household", "user_fact:profile.allergy",
+                "user_preference:profile.lang", "task_state:task.cooking",
+                "episodic:ep.export.denied",
+            },
         ),
         (
             "mcp.market",
-            {"profile.household", "profile.allergy", "profile.lang", "task.market", "ep.market.schema", "ep.export.denied"},
+            {
+                "user_fact:profile.household", "user_fact:profile.allergy",
+                "user_preference:profile.lang", "task_state:task.market",
+                "episodic:ep.market.schema", "episodic:ep.export.denied",
+            },
         ),
         (
             None,
-            {"profile.household", "profile.allergy", "profile.lang", "ep.export.denied"},
+            {"user_fact:profile.household", "user_fact:profile.allergy",
+             "user_preference:profile.lang", "episodic:ep.export.denied"},
         ),
     ]
     tp = fp = fn = 0
@@ -505,7 +534,8 @@ def run_track_c(provider_name: str, model_name: str) -> tuple[list[dict], list[d
                 lambda: app.invoke(
                     {"messages": [HumanMessage(content=case["user"])]},
                     {"configurable": {"thread_id": f"eval-{case['id']}"}},
-                )
+                ),
+                on_retry=lambda: recorded.update(calls=[], schema_errors=0),
             )
             events = _extract_events(state)
             run_error = ""
@@ -583,7 +613,7 @@ def judge_transcripts(provider_name: str, model_name: str, transcripts: list[dic
 def main() -> int:
     parser = argparse.ArgumentParser(description="post-change capability routing evaluation")
     parser.add_argument("--output", default="artifacts")
-    parser.add_argument("--real", action="store_true", help="执行真实模型轨道（默认开启）")
+    parser.add_argument("--real", action="store_true", help="（兼容参数）真实模型轨道默认已包含")
     parser.add_argument("--skip-real", action="store_true", help="只跑确定性轨道")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--judge", action="store_true", help="对端到端 transcript 运行 LLM-as-judge")

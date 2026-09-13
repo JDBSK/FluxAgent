@@ -119,22 +119,22 @@ class TestGatewayValidation(unittest.TestCase):
         self.assertEqual(result.status, ToolCallStatus.STALE_CONTRACT)
 
     def test_defensive_unavailable_check_on_frozen_snapshot(self):
-        # 防御分支：手工构造"契约声称允许但不健康能力"的 snapshot（正常流程
-        # 不会出现，Gateway 仍必须拦截）。
+        # 分层防御：不健康能力在重排阶段即被过滤（永不成为候选），隐式路由
+        # 得到 answer_without_tools；其契约不含任何工具，Gateway 对任何调用
+        # 按 ROUTE_MISMATCH 拒绝——两层都 fail-closed，故障能力既不可路由
+        # 也不可执行。
         capability = make_capability("cap.sick", health=ProviderHealth.UNAVAILABLE)
         registry = CapabilityRegistry()
         registry.register(capability)
         snapshot = registry.snapshot()
         router = HybridRouter(embedding_provider=DeterministicEmbedding(dim=64))
-        contract = router.build_contract(
-            router._build_route(
-                capability, "查询数据", snapshot, audit={}, path="manual"
-            ),
-            snapshot,
-        )
+        router.rebuild_index(snapshot)
+        decision = router.decide("查询数据", snapshot)
+        self.assertEqual(decision.route, "answer_without_tools")
+        contract = router.build_contract(decision, snapshot)
         gateway = ExecutionGateway(contract, snapshot)
         result = gateway.validate("mcp_cap.sick_op", {"query": "x"})
-        self.assertEqual(result.status, ToolCallStatus.PROVIDER_UNAVAILABLE)
+        self.assertEqual(result.status, ToolCallStatus.ROUTE_MISMATCH)
 
 
 class TestCircuitBreaker(unittest.TestCase):

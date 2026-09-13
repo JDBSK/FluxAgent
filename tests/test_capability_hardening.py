@@ -162,11 +162,14 @@ class TestMemoryWriteSide(unittest.TestCase):
             )
 
         record_ids = {r.record_id for r in store.all_records()}
-        # task_state 生产者：当前回合任务已写入
-        self.assertIn("task:mem-test", record_ids)
+        # task_state 生产者：仅在外部能力被路由时写入（builtin-only 回合不产生任务态）
+        self.assertNotIn("task:mem-test", record_ids)
+        self.assertNotIn("task:mem-test@@mem-test", record_ids)
         # episodic 生产者：工具失败已写入（calculator 对非法表达式返回失败）
         episodic = [r for r in store.all_records() if r.record_id.startswith("episodic:")]
         self.assertTrue(episodic, "工具失败应写入 episodic 记忆")
+        # 会话边界：episodic 记录必须归属本会话
+        self.assertTrue(all(r.session_id == "mem-test" for r in episodic))
 
     def test_tagged_memory_excluded_from_abstain_turns(self):
         """跨任务泄漏回归：abstain 回合不得看到其他能力的带标签记忆。"""
@@ -182,6 +185,53 @@ class TestMemoryWriteSide(unittest.TestCase):
         )
         self.assertNotIn("茅台", snapshot.system_prompt)
         self.assertIn("通用事实", snapshot.system_prompt)
+
+    def test_cross_session_memory_boundary(self):
+        """跨会话数据边界：会话 A 的任务态不得进入会话 B；全局记录不受限。"""
+        store = MemoryStore()
+        store.add(
+            MemoryScope.TASK_STATE, "会话A正在分析茅台", key="task:A",
+            capability_tags=("mcp.market",), session_id="session-A",
+        )
+        store.add(
+            MemoryScope.EPISODIC, "会话A工具失败记录", key="ep:A",
+            capability_tags=("mcp.market",), session_id="session-A",
+        )
+        store.add(MemoryScope.USER_FACT, "全局过敏原：对虾", key="profile.allergy")
+        compiler = ContextCompiler(store, token_budget=4000)
+
+        # 会话 B 的市场请求：不得看到会话 A 的任何记录，全局事实可见
+        snapshot_b = compiler.compile(
+            CompilationContext(
+                user_text="看盘", route="route", intent="quote_lookup",
+                capability_ids=("mcp.market",),
+                memory_scopes=("user_fact", "task_state", "episodic"),
+                session_id="session-B",
+            )
+        )
+        self.assertNotIn("会话A", snapshot_b.system_prompt)
+        self.assertIn("对虾", snapshot_b.system_prompt)
+
+        # 会话 A 自己的请求：可见本会话记录
+        snapshot_a = compiler.compile(
+            CompilationContext(
+                user_text="看盘", route="route", intent="quote_lookup",
+                capability_ids=("mcp.market",),
+                memory_scopes=("user_fact", "task_state", "episodic"),
+                session_id="session-A",
+            )
+        )
+        self.assertIn("会话A正在分析茅台", snapshot_a.system_prompt)
+
+        # fail-closed：编译器未提供会话上下文时，会话级记录一律排除
+        snapshot_noctx = compiler.compile(
+            CompilationContext(
+                user_text="看盘", route="route", intent="quote_lookup",
+                capability_ids=("mcp.market",),
+                memory_scopes=("user_fact", "task_state", "episodic"),
+            )
+        )
+        self.assertNotIn("会话A", snapshot_noctx.system_prompt)
 
 
 class TestDenseIndexRoundtrip(unittest.TestCase):

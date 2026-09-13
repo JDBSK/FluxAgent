@@ -176,6 +176,138 @@ def _candidate_labels_to_capability(doc_id: str) -> str:
     return doc_id
 
 
+# ---------- 规模扫描：任意能力集的词法检索质量（与已安装项无关） ----------
+
+# 合成词库：域词池 + 修饰词，组合生成任意规模的"看起来真实"的能力卡。
+# 每个能力独占若干词 + 与同域能力共享域词——复刻真实语料的混淆结构。
+_SCALE_DOMAIN_WORDS = [
+    "行情", "菜谱", "天气", "翻译", "文件", "日程", "库存", "工单", "账单", "物流",
+    "审批", "报表", "画像", "推荐", "检索", "监控", "告警", "回执", "档案", "预约",
+    "排班", "计费", "合同", "积分", "问卷", "课时", "药品", "航段", "赛事", "票据",
+]
+_SCALE_ACTION_WORDS = [
+    "查询", "创建", "更新", "导出", "校验", "汇总", "分发", "匹配", "追踪", "归档",
+]
+_SCALE_FILLER = [
+    "服务", "数据", "记录", "详情", "列表", "摘要", "状态", "配置", "结果", "报告",
+]
+
+
+def build_scale_corpus(num_capabilities: int):
+    """生成通用合成能力语料（与当前安装项完全无关）。
+
+    返回 (registry, labeled_queries, doc_count)：labeled_queries 为
+    (query, capability_id) 的词法可达标注——查询由该能力独占词+域词构成。
+    """
+    registry = CapabilityRegistry()
+    labeled: list[tuple[str, str]] = []
+    per_domain = max(2, num_capabilities // len(_SCALE_DOMAIN_WORDS) + 1)
+    made = 0
+    for domain_index, domain_word in enumerate(_SCALE_DOMAIN_WORDS):
+        for item in range(per_domain):
+            if made >= num_capabilities:
+                break
+            action = _SCALE_ACTION_WORDS[(domain_index + item) % len(_SCALE_ACTION_WORDS)]
+            filler_a = _SCALE_FILLER[(domain_index * 3 + item) % len(_SCALE_FILLER)]
+            filler_b = _SCALE_FILLER[(domain_index * 7 + item * 2) % len(_SCALE_FILLER)]
+            unique_token = f"u{domain_index:02d}{item:02d}"
+            capability_id = f"cap.gen{domain_index:02d}.{item:02d}"
+            name = f"Gen{domain_index:02d}Svc{item:02d}"
+            description = f"{action}{domain_word}{filler_a}与{filler_b}的{unique_token}处理"
+            op_name = f"mcp_gen{domain_index:02d}_{item:02d}_run"
+            op = OperationDescriptor(
+                capability_id=capability_id,
+                name=op_name,
+                operation_id=f"{capability_id}/{op_name}",
+                description=description,
+                input_schema={"type": "object", "properties": {"value": {"type": "string"}}},
+                side_effect_level=RiskLevel.READ,
+                tool=object(),
+            )
+            registry.register(
+                CapabilityDescriptor(
+                    capability_id=capability_id,
+                    version="1",
+                    kind="mcp",
+                    name=name,
+                    description=description,
+                    intents=(domain_word,),
+                    examples=(f"{action}{domain_word}{filler_a}",),
+                    operations=(op,),
+                )
+            )
+            # 词法可达查询：独占词 + 域词 + 动作
+            labeled.append((f"{action}{unique_token}{domain_word}{filler_a}", capability_id))
+            made += 1
+        if made >= num_capabilities:
+            break
+    return registry, labeled, {"capabilities": made, "operations": made}
+
+
+def evaluate_scale(scale_num: int) -> dict[str, Any]:
+    """在指定能力规模下测词法路由质量与延迟（确定性，0 API）。
+
+    两组指标：
+    - decision_accuracy_lexical：带独占 nonce 的标注查询（可达性上界）；
+    - domain_discrimination_accuracy：无 nonce 的域内混淆查询——只要求路由到
+      同域任一兄弟能力，度量规模增大时域间/域内的区分度退化。
+    """
+    registry, labeled, counts = build_scale_corpus(scale_num)
+    snapshot = registry.snapshot()
+    router = HybridRouter(embedding_provider=DeterministicEmbedding(dim=256))
+    started = time.perf_counter()
+    router.rebuild_index(snapshot)
+    index_seconds = round(time.perf_counter() - started, 3)
+
+    correct = 0
+    latencies: list[float] = []
+    for query, label in labeled:
+        began = time.perf_counter()
+        decision = router.decide(query, snapshot)
+        latencies.append((time.perf_counter() - began) * 1000.0)
+        if decision.route == "route" and list(decision.capability_ids) == [label]:
+            correct += 1
+
+    # 域内混淆查询：action+domain+filler（无 nonce），期望路由到该域任一能力
+    domain_groups: dict[str, set[str]] = {}
+    for _query, cap_label in labeled:
+        domain = cap_label.split(".")[1]
+        domain_groups.setdefault(domain, set()).add(cap_label)
+    discrimination_correct = 0
+    discrimination_total = 0
+    for domain, siblings in domain_groups.items():
+        domain_index = _SCALE_DOMAIN_WORDS.index(domain)
+        for item in range(max(1, len(siblings) // 2)):
+            action = _SCALE_ACTION_WORDS[(domain_index + item) % len(_SCALE_ACTION_WORDS)]
+            filler = _SCALE_FILLER[(domain_index * 3 + item) % len(_SCALE_FILLER)]
+            query = f"{action}{domain}{filler}"
+            began = time.perf_counter()
+            decision = router.decide(query, snapshot)
+            latencies.append((time.perf_counter() - began) * 1000.0)
+            discrimination_total += 1
+            if decision.route == "route" and decision.capability_ids and (
+                decision.capability_ids[0] in siblings
+            ):
+                discrimination_correct += 1
+    return {
+        "capabilities": counts["capabilities"],
+        "decision_accuracy_lexical": round(correct / len(labeled), 4) if labeled else 0.0,
+        "domain_discrimination_accuracy": (
+            round(discrimination_correct / discrimination_total, 4)
+            if discrimination_total
+            else None
+        ),
+        "avg_decision_latency_ms": round(statistics.mean(latencies), 2) if latencies else 0.0,
+        "index_build_seconds": index_seconds,
+        "queries": len(labeled),
+        "discrimination_queries": discrimination_total,
+    }
+
+
+def run_scale_sweep(scales=(20, 50, 100)) -> list[dict[str, Any]]:
+    return [evaluate_scale(scale) for scale in scales]
+
+
 def evaluate_retriever(rank_fn, k_values=(1, 3)) -> dict[str, Any]:
     """对标注查询集计算 recall@k、MRR、平均延迟。rank_fn(query)->有序 doc_id 列表。"""
     recalls = {f"recall@{k}": [] for k in k_values}
@@ -256,7 +388,20 @@ def run_metrics(include_real_embedding: bool = False) -> dict[str, Any]:
     for capability in snapshot.enabled_capabilities():
         docs.append(Document(f"cap:{capability.capability_id}", capability.searchable_text()))
         for operation in capability.operations:
-            docs.append(Document(f"op:{operation.operation_id}", operation.name + " " + operation.description))
+            # 与 router.rebuild_index 的 op 文档组装保持一致（消除语料差异因素）
+            op_text = "\n".join(
+                part
+                for part in (
+                    operation.name,
+                    operation.description,
+                    " ".join(operation.required_slots),
+                    " ".join(operation.examples),
+                    capability.name,
+                    " ".join(capability.intents),
+                )
+                if part
+            )
+            docs.append(Document(f"op:{operation.operation_id}", op_text))
     bm25.rebuild(docs)
 
     def bm25_rank(query: str) -> list[str]:
@@ -330,8 +475,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="retrieval quality metrics")
     parser.add_argument("--output", default="artifacts")
     parser.add_argument("--real-embedding", action="store_true")
+    parser.add_argument("--scale-sweep", action="store_true", help="运行任意能力集规模扫描")
     args = parser.parse_args()
     report = run_metrics(include_real_embedding=args.real_embedding)
+    if args.scale_sweep:
+        report["scale_sweep"] = run_scale_sweep((20, 50, 100))
     os.makedirs(args.output, exist_ok=True)
     out_path = os.path.join(args.output, "retrieval_metrics.json")
     with open(out_path, "w", encoding="utf-8") as fh:
@@ -342,6 +490,13 @@ def main() -> int:
             f"[retrieval] {name}: recall@1={metrics['recall@1']} "
             f"recall@3={metrics['recall@3']} mrr={metrics['mrr']} "
             f"latency={metrics['avg_latency_ms']}ms"
+        )
+    for entry in report.get("scale_sweep", []):
+        print(
+            f"[scale] capabilities={entry['capabilities']}: "
+            f"decision_accuracy={entry['decision_accuracy_lexical']} "
+            f"latency={entry['avg_decision_latency_ms']}ms "
+            f"index_build={entry['index_build_seconds']}s"
         )
     print(f"[retrieval] report -> {out_path}")
     return 0

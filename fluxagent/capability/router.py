@@ -30,15 +30,19 @@ from .retrieval import (
 
 ROUTE_DECISIONS = frozenset({"route", "answer_without_tools", "clarify", "unavailable"})
 
+# 索引构建逻辑版本：语料选择规则变化（如 v2 排除 builtin）时递增，
+# 使旧持久化索引整体失效——否则代码升级后仍会加载带旧语料的索引。
+INDEX_FORMAT_VERSION = "2"
+
 _STOPWORDS = frozenset({
     "the", "and", "for", "with", "please", "help", "me", "my", "a", "an", "to",
     "的", "了", "吗", "呢", "吧", "我", "你", "他", "她", "它", "请", "帮我",
 })
 
 _EXPLICIT_PATTERN = re.compile(
-    r"(?:用|使用|调用|切换到|选择|use|call|switch\s+to)\s*"
+    r"(?:\buse\b|\bcall\b|\bswitch\s+to\b|用|使用|调用|切换到|选择)\s*"
     r"([\w./:\-\u4e00-\u9fff]+(?:\s+[\w./:\-\u4e00-\u9fff]+){0,2})\s*"
-    r"(mcp|skill|服务|后端)",
+    r"(?:\bmcp\b|\bskill\b|mcp|skill|服务|后端)",
     re.IGNORECASE,
 )
 
@@ -126,6 +130,9 @@ class HeuristicReranker:
         query_tokens = {
             token for token in tokenize(query) if len(token) >= 2 and token not in _STOPWORDS
         }
+        # 覆盖度分母取信息量最高的前 12 个查询词（按长度）——长查询的 filler
+        # 词会把覆盖率稀释到门槛之下，造成长请求假 abstain
+        denom_tokens = sorted(query_tokens, key=len, reverse=True)[:12]
         max_fused = max(candidate.score for candidate in candidates) or 1.0
 
         # 能力级去重：每个能力保留融合分最高的代表文档
@@ -138,9 +145,11 @@ class HeuristicReranker:
         scored: List[Tuple[Candidate, float]] = []
         for candidate in best_by_capability.values():
             cap = candidate.capability
-            # 覆盖度对全量能力卡计算（含描述/意图/示例/别名），对齐 BM25 的信息面
+            # 覆盖度信息面 = 全量能力卡 ∪ 候选 op 文本（查询词可能只命中 op 卡）
             text_tokens = set(tokenize(cap.searchable_text()))
-            coverage = len(query_tokens & text_tokens) / max(1, len(query_tokens))
+            if candidate.operation is not None:
+                text_tokens.update(tokenize(candidate.operation.description))
+            coverage = len(query_tokens & text_tokens) / max(1, len(denom_tokens))
             if coverage < self.min_coverage:
                 continue  # 证据不足：该候选不可路由
             rrf_norm = candidate.score / max_fused
@@ -155,6 +164,8 @@ class HeuristicReranker:
                 ProviderHealth.DEGRADED: 0.25,
                 ProviderHealth.UNAVAILABLE: 1.0,
             }[cap.provider_health]
+            if health_penalty >= 1.0:
+                continue  # 不可用能力在检索序模式下也无条件排除（与显式路径一致）
             missing = _missing_required_slots(candidate, query)
             score = (
                 0.7 * coverage
@@ -165,7 +176,8 @@ class HeuristicReranker:
             )
             scored.append((candidate, score))
         if self.order_by == "retrieval":
-            # 保持 RRF 融合名次（即 BM25 名次），只保留通过门槛/惩罚的候选
+            # 保持 RRF 融合名次（即 BM25 名次），只保留通过门槛/惩罚的候选；
+            # 返回的分数仍是启发式分，供 _decide_hybrid 的阈值判定使用
             scored.sort(key=lambda kv: (-kv[0].score, kv[0].doc_id))
             return scored
         scored.sort(key=lambda kv: (-kv[1], kv[0].doc_id))
@@ -191,10 +203,9 @@ class LLMReranker:
     audit 中标注 fallback，绝不扩大候选集。
     """
 
-    def __init__(self, chat_model: Any, fallback: Optional[Any] = None, timeout_seconds: float = 20.0) -> None:
+    def __init__(self, chat_model: Any, fallback: Optional[Any] = None) -> None:
         self.chat_model = chat_model
         self.fallback = fallback or HeuristicReranker()
-        self.timeout_seconds = timeout_seconds
         self.last_fallback_reason = ""
 
     def rerank(self, query: str, candidates: Sequence[Candidate]) -> List[Tuple[Candidate, float]]:
@@ -304,9 +315,16 @@ class HybridRouter:
     # ---------- 索引维护 ----------
 
     def rebuild_index(self, snapshot: RegistrySnapshot) -> None:
+        """原子重建：新索引在本地构建（含远程 embedding 调用），全部成功后
+        在锁内一次性换装——失败不撕裂状态，并发读者不见中间态。"""
         docs: List[Document] = []
         mapping: Dict[str, Tuple[CapabilityDescriptor, Optional[OperationDescriptor]]] = {}
         for capability in snapshot.enabled_capabilities():
+            if capability.kind == "builtin":
+                # builtin 内置工具每回合无条件可用，不是路由目标；
+                # 进入检索索引只会让"工具不存在"的请求错配到内置工具上
+                # （真实语料实测：查行情→路由到 list_scheduled_tasks）
+                continue
             docs.append(
                 Document(
                     doc_id=f"cap:{capability.capability_id}",
@@ -336,9 +354,13 @@ class HybridRouter:
                     )
                 )
                 mapping[f"op:{op.operation_id}"] = (capability, op)
+        new_bm25 = BM25Index()
+        new_bm25.rebuild(docs)
+        new_dense = DenseIndex()
+        new_dense.rebuild([(d.doc_id, d.text) for d in docs], self.embedding_provider)
         with self._index_lock:
-            self._bm25.rebuild(docs)
-            self._dense.rebuild([(d.doc_id, d.text) for d in docs], self.embedding_provider)
+            self._bm25 = new_bm25
+            self._dense = new_dense
             self._docs_by_id = mapping
             self._index_registry_version = snapshot.version
 
@@ -353,20 +375,24 @@ class HybridRouter:
     # ---------- 索引持久化 ----------
 
     def save_index(self, directory: str) -> None:
-        """按 registry 版本持久化两路索引；版本不匹配的旧文件直接覆盖。"""
+        """按 registry 版本持久化两路索引（原子写 + 每文件内嵌校验头）。"""
         import os
 
         os.makedirs(directory, exist_ok=True)
         with self._index_lock:
-            self._bm25.save(os.path.join(directory, "bm25.json"))
-            self._dense.save(os.path.join(directory, "dense.json"))
+            header = {
+                "format": INDEX_FORMAT_VERSION,
+                "registry_version": self._index_registry_version,
+                "embedding_tag": self.embedding_provider.model_tag,
+            }
+            self._bm25.save(os.path.join(directory, "bm25.json"), header)
+            self._dense.save(os.path.join(directory, "dense.json"), header)
             with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as fh:
                 import json
 
                 json.dump(
                     {
-                        "registry_version": self._index_registry_version,
-                        "embedding_tag": self.embedding_provider.model_tag,
+                        **header,
                         "doc_count": len(self._docs_by_id),
                     },
                     fh,
@@ -376,8 +402,9 @@ class HybridRouter:
     def load_index(self, directory: str, snapshot: RegistrySnapshot) -> bool:
         """尝试加载与当前 registry 版本和 embedding tag 匹配的持久化索引。
 
-        成功返回 True（不再重建）；版本不匹配/文件损坏返回 False（调用方
-        必须 rebuild），绝不允许旧索引配新注册表。
+        成功返回 True（不再重建）；索引格式版本、registry 版本、embedding tag
+        任一不匹配或文件损坏时返回 False（调用方必须 rebuild），绝不允许旧
+        索引配新代码/新注册表。
         """
         import json
         import os
@@ -388,6 +415,8 @@ class HybridRouter:
                 meta = json.load(fh)
         except (OSError, ValueError):
             return False
+        if meta.get("format") != INDEX_FORMAT_VERSION:
+            return False
         if meta.get("registry_version") != snapshot.version:
             return False
         if meta.get("embedding_tag") != self.embedding_provider.model_tag:
@@ -395,15 +424,24 @@ class HybridRouter:
         try:
             bm25 = BM25Index.load(os.path.join(directory, "bm25.json"))
             dense = DenseIndex.load(os.path.join(directory, "dense.json"))
-        except (OSError, ValueError, KeyError):
+            # 逐文件校验头：防止多进程交错写出的"meta 新 + 数据旧"组合
+            for payload_header in (bm25._header, dense._header):
+                if payload_header.get("format") != INDEX_FORMAT_VERSION \
+                        or payload_header.get("registry_version") != snapshot.version \
+                        or payload_header.get("embedding_tag") != self.embedding_provider.model_tag:
+                    return False
+        except (OSError, ValueError, KeyError, AttributeError):
             return False
         with self._index_lock:
             self._bm25 = bm25
             self._dense = dense
             self._index_registry_version = snapshot.version
-            # doc_id -> descriptor 映射从 snapshot 重建（描述可内存推导，无需持久化）
+            # doc_id -> descriptor 映射从 snapshot 重建（与 rebuild 的语料选择
+            # 规则一致：排除 builtin；描述可内存推导，无需持久化）
             mapping: Dict[str, Tuple[CapabilityDescriptor, Optional[OperationDescriptor]]] = {}
             for capability in snapshot.enabled_capabilities():
+                if capability.kind == "builtin":
+                    continue
                 mapping[f"cap:{capability.capability_id}"] = (capability, None)
                 for operation in capability.operations:
                     mapping[f"op:{operation.operation_id}"] = (capability, operation)
@@ -421,7 +459,18 @@ class HybridRouter:
     ) -> RouteDecision:
         text = str(user_text or "").strip()
         if self._index_registry_version != snapshot.version:
-            self.rebuild_index(snapshot)
+            try:
+                self.rebuild_index(snapshot)
+            except EmbeddingError as exc:
+                # 重建失败（如远程 embedding 不可用）：明确 unavailable，
+                # 不抛出、不留下撕裂的中间索引状态
+                return self._decision(
+                    route="unavailable",
+                    intent="retrieval_provider_error",
+                    snapshot=snapshot,
+                    reason=f"索引重建失败: {exc}",
+                    audit={"path": "decide", "error": str(exc)[:200]},
+                )
 
         resolved = explicit_capability or self._resolve_explicit(text, snapshot)
         if resolved is not None:
@@ -431,10 +480,24 @@ class HybridRouter:
 
     # ---------- 显式路由 ----------
 
+    @staticmethod
+    def _alias_in_text(alias: str, lowered_text: str) -> bool:
+        """别名命中判定：ASCII 别名要求词边界（避免 search 命中 research），
+        CJK 别名保持子串匹配。"""
+        import re as _re
+
+        if all(ord(ch) < 128 for ch in alias):
+            return _re.search(
+                rf"(?<![a-z0-9_]){ _re.escape(alias)}(?![a-z0-9_])", lowered_text
+            ) is not None
+        return alias in lowered_text
+
     def _resolve_explicit(self, text: str, snapshot: RegistrySnapshot) -> Optional[str]:
         """解析'使用 X mcp/skill'语法和别名包含；最长匹配，并列视为歧义。"""
         alias_map: Dict[str, List[str]] = {}
         for capability in snapshot.enabled_capabilities():
+            if capability.kind == "builtin":
+                continue
             aliases = set()
             aliases.add(capability.capability_id.casefold())
             aliases.add(capability.name.strip().casefold())
@@ -448,7 +511,10 @@ class HybridRouter:
         lowered = text.casefold()
         matches: List[Tuple[int, str]] = []
         for alias, capability_ids in alias_map.items():
-            if alias in lowered and len(alias) >= 2:
+            if len(alias) >= 2 and self._alias_in_text(alias, lowered):
+                if len(capability_ids) > 1:
+                    # 同名别名跨能力共享：无法唯一解析，必须 clarify 而非静默取第一个
+                    return ""
                 matches.append((len(alias), capability_ids[0]))
         if matches:
             matches.sort(reverse=True)
@@ -570,6 +636,20 @@ class HybridRouter:
             and abs(best_score - second_score) < 1e-9
             and ranked[1][0].capability_id != best_candidate.capability_id
         )
+        # B2 补丁：词法模式下检索器原始分同分（不同能力）也是并列歧义——
+        # RRF 名次化会把原始同分变成相邻名次差，启发式分也可能不再相等，
+        # 仅靠 ranked 分数判歧义会漏检
+        if not ambiguous and len(bm25_ranking) >= 2:
+            (top_id, top_raw), (second_id, second_raw) = bm25_ranking[0], bm25_ranking[1]
+            if abs(top_raw - second_raw) < 1e-9:
+                top_cap = self._docs_by_id.get(top_id)
+                second_cap = self._docs_by_id.get(second_id)
+                if (
+                    top_cap is not None
+                    and second_cap is not None
+                    and top_cap[0].capability_id != second_cap[0].capability_id
+                ):
+                    ambiguous = True
         audit = {
             "path": "hybrid",
             "fused": [(doc_id, round(score, 6)) for doc_id, score in fused],
@@ -607,28 +687,37 @@ class HybridRouter:
         audit: Mapping[str, Any],
         path: str,
     ) -> RouteDecision:
+        if capability.provider_health in {ProviderHealth.UNAVAILABLE, ProviderHealth.DEGRADED}:
+            # B4 补丁：hybrid 路径与显式路径的健康门槛保持一致（fail-closed）
+            return self._decision(
+                route="unavailable",
+                intent="capability_unhealthy",
+                snapshot=snapshot,
+                reason=f"能力当前不可用: {capability.capability_id} ({capability.provider_health.value})",
+                audit=audit,
+            )
         operations = list(capability.operations)
         tool_ids: Tuple[str, ...] = tuple(op.name for op in operations if op.tool is not None)
         operation_ids = tuple(op.operation_id for op in operations)
-        missing = sorted(
-            {
-                slot
-                for op in operations
-                for slot in _missing_required_slots(
-                    Candidate(
-                        doc_id="",
-                        capability_id=capability.capability_id,
-                        kind=capability.kind,
-                        name=capability.name,
-                        text=op.description,
-                        score=0.0,
-                        capability=capability,
-                        operation=op,
-                    ),
-                    text,
-                )
-            }
-        )
+        # S3：missing_slots 按最优匹配 operation 计算（取缺口最小的 op），
+        # 不再把用户未涉及操作的槽位全部报缺失
+        per_op_missing = [
+            _missing_required_slots(
+                Candidate(
+                    doc_id="",
+                    capability_id=capability.capability_id,
+                    kind=capability.kind,
+                    name=capability.name,
+                    text=op.description,
+                    score=0.0,
+                    capability=capability,
+                    operation=op,
+                ),
+                text,
+            )
+            for op in operations
+        ]
+        missing = sorted(min(per_op_missing, key=len)) if per_op_missing else []
         intent = capability.intents[0] if capability.intents else capability.capability_id
         memory_scopes = ("user_fact", "user_preference", "task_state", "episodic")
         return self._decision(

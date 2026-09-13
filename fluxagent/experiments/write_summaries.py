@@ -115,6 +115,22 @@ EVALUATION_MD = """# 统一能力路由定向测评总结
 - C 轨 schema 熔断 1 例：模型首次调用即符合 `queries` 数组契约；此前一次运行（工具 schema 声明漂移）实证了失败链路：Gateway 全部拦截 → 模型**不换参数重试**，如实说明失败并直接回答。
 - LLM-as-judge：对 **A+C 全部 {judge_n} 条 transcript** 真实评审（rubric：切题完整/失败说明/不编造数据），结果：{judge_summary}。
 
+## 2bis. 规模扫描与长会话记忆（与已安装能力无关的通用性证据）
+
+**规模扫描**（合成语料，词法可达查询 / 域内混淆查询，0 API）：
+
+| 能力数 | 词法决策准确率 | 域内区分度 | 平均决策延迟 | 索引构建 |
+|---|---|---|---|---|
+{scale_rows}
+
+**长会话记忆回归**（60 轮、每 5 轮切域、同域保留路径覆盖、历史膨胀施压）：
+四个高发失效模式全部零违规——F1 跨域任务态/episodic 泄漏、F2 任务态堆积（同 key 覆盖，库内恒 1 条）、F3 token 预算失守（峰值 {ls_max}/2200，规则与契约段存活）、F4 敏感/过期复活。记忆库有界：task 1 条 + episodic 6 条（TTL 约束）。
+
+**数据边界（本项验证后修复/确认）**：
+- 修复：跨会话泄漏（session 归属 + fail-closed 查询/写入命名空间）、builtin 混入路由索引导致"查行情→list_scheduled_tasks"的真实部署级错配（INDEX_FORMAT_VERSION 失效机制随之建立）；
+- 确认：MCP 登记路径指向项目外旧目录时 fail-closed（不连接、不建索引、标记 UNAVAILABLE 需重装）；
+- 能力缺失场景（订票/黄金/比特币/显式未注册）：不把请求错配到已有工具，直接回答或澄清。
+
 ## 3bis. 修改前/后同题对比（git worktree 基线 11f0aa5 vs 当前，同一真实模型）
 
 单一能力集（4 合成能力 + 16 内置）、6 用例单轮 + 4 轮混合域会话（股票→菜谱→情感→菜谱恢复）：
@@ -144,7 +160,7 @@ EVALUATION_MD = """# 统一能力路由定向测评总结
 ## 6. 运行方式
 
 ```cmd
-run_overnight.cmd   :: 回归 -> 定向测评（含指标） -> 总结，任一阶段失败即停
+run_overnight.cmd   :: 回归 -> 能力测试 -> 定向测评（含规模扫描） -> 长会话回归 -> 真实语料冒烟 -> 总结
 ```
 """
 
@@ -212,6 +228,21 @@ def main() -> int:
         with open(retrieval_path, encoding="utf-8") as fh:
             metrics = json.load(fh)
 
+    scale_rows = ""
+    ls_max = "n/a"
+    ls_path = os.path.join(os.path.dirname(args.eval_json) or ".", "long_session_memory.json")
+    if os.path.exists(ls_path):
+        with open(ls_path, encoding="utf-8") as fh:
+            ls = json.load(fh)
+        ls_max = ls.get("token_stats", {}).get("max", "n/a")
+    for entry in metrics.get("scale_sweep", []):
+        scale_rows += (
+            f"| {entry['capabilities']} | {entry['decision_accuracy_lexical']} | "
+            f"{entry.get('domain_discrimination_accuracy')} | "
+            f"{entry['avg_decision_latency_ms']}ms | {entry['index_build_seconds']}s |"
+            "\n"
+        )
+
     def _m(section, key, default="n/a"):
         value = (metrics.get(section) or {}).get(key)
         return value if value is not None else default
@@ -267,6 +298,8 @@ def main() -> int:
                 new_acc=new_acc,
                 old_multi=old_multi,
                 new_multi=new_multi,
+                scale_rows=scale_rows or "| (未运行) | | | | |",
+                ls_max=ls_max,
             )
         )
 
