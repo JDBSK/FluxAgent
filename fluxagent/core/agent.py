@@ -88,7 +88,7 @@ from ..capability.context_compiler import (
     MemoryStore,
     ProfileCompatProvider,
 )
-from ..capability.descriptors import CapabilityDescriptor
+from ..capability.descriptors import CapabilityDescriptor, ProviderHealth
 from ..capability.gateway import CircuitBreaker, ExecutionGateway
 from ..capability.providers import descriptors_from_tools
 from ..capability.registry import CapabilityRegistry, RegistryError, RegistrySnapshot
@@ -638,6 +638,9 @@ def create_agent_app(
     _breaker = CircuitBreaker()
     # 每会话缓存本回合路由结果：(thread_id -> (user_text, decision, contract, scoped, label))
     _turn_scopes: dict[str, tuple] = {}
+    # 每会话已完成步骤级重路由评估的 (step_index, action) 指纹：同一回合内
+    # 每个计划步骤至多评估一次，agent 工具循环的重复 agent_node 调用不重复路由
+    _turn_routed_steps: dict[str, tuple[int, str]] = {}
     # 每会话最近用户请求（会话上下文路由救援用，指代轮"回到刚才的话题"）
     _recent_user_turns: dict[str, list] = {}
     _router_lock = threading.RLock()
@@ -860,6 +863,7 @@ def create_agent_app(
     def _reset_turn_scope(thread_id: str) -> None:
         with _router_lock:
             _turn_scopes.pop(thread_id, None)
+            _turn_routed_steps.pop(thread_id, None)
         # 新用户回合重新读取画像：save_user_profile 的写入立即对下一回合生效
         try:
             # record_id 带 scope 前缀（如 user_fact:profile.household），
@@ -872,6 +876,143 @@ def create_agent_app(
             )
         except Exception:  # noqa: BLE001 - 记忆刷新失败不阻断任务
             pass
+
+    def _maybe_step_reroute(
+        thread_id: str,
+        state: AgentState,
+        decision: RouteDecision,
+        contract: InvocationContract,
+        scoped_tools: list[BaseTool],
+        scope_label: str,
+    ) -> tuple[RouteDecision, InvocationContract, list[BaseTool]]:
+        """步骤级重路由：多步任务推进到需要其他外部能力的新步骤时，用步骤
+        文本重新路由并**只增不删**地扩充本回合契约（先前步骤的工具保持可用，
+        授权在回合内单调不减）。
+
+        - 触发以 (step_index, action) 指纹去重：每个计划步骤至多评估一次，
+          agent 工具循环的重复 agent_node 调用不会反复触发路由；
+        - task_plan 只能由 planner/replan 节点整表替换（Agent 侧消息无法
+          修改计划），扩权的信任边界与计划本身一致；
+        - fail-closed：abstain/歧义/能力不可用/不可执行（prompt_skill）一律
+          维持原契约；扩权结果写回回合缓存，供路由闸门与 Gateway 复用。
+        """
+        task_plan = state.get("task_plan") or []
+        step_index = int(state.get("step_index", 0) or 0)
+        if not task_plan or step_index < 0 or step_index >= len(task_plan):
+            return decision, contract, scoped_tools
+        step = task_plan[step_index]
+        action_text = (
+            str(step.get("action", "")).strip() if isinstance(step, dict) else ""
+        )
+        if not action_text:
+            return decision, contract, scoped_tools
+        fingerprint = (step_index, action_text)
+        with _router_lock:
+            already_evaluated = _turn_routed_steps.get(thread_id) == fingerprint
+            _turn_routed_steps[thread_id] = fingerprint
+        if already_evaluated:
+            return decision, contract, scoped_tools
+
+        snapshot = capability_registry.snapshot()
+        if contract.decision.registry_version != snapshot.version:
+            # 契约已因注册表变化过期，交回既有失效/重路由路径处理
+            return decision, contract, scoped_tools
+
+        # 显式解析/歧义/提示词命中未注册——全部由 Router 自身的 fail-closed
+        # 语义处理（clarify/abstain → 不扩权），这里不做二次解释
+        step_decision = _router.decide(action_text, snapshot)
+        new_caps = tuple(
+            cap_id
+            for cap_id in step_decision.capability_ids
+            if cap_id not in contract.decision.capability_ids
+        )
+        if step_decision.route != "route" or not new_caps:
+            audit_logger.log_event(
+                thread_id=thread_id,
+                event="system_action",
+                action="step_reroute_kept",
+                step_index=step_index,
+                reason=(
+                    "already_authorized" if step_decision.route == "route"
+                    else f"no_expansion:{step_decision.route}"
+                ),
+            )
+            return decision, contract, scoped_tools
+
+        added_tools: dict[str, BaseTool] = {}
+        added_operations: list[str] = []
+        for cap_id in new_caps:
+            capability = snapshot.get(cap_id)
+            if (
+                capability is None
+                or not capability.enabled
+                or capability.kind == "prompt_skill"
+                or capability.provider_health
+                in {ProviderHealth.UNAVAILABLE, ProviderHealth.DEGRADED}
+            ):
+                continue  # 不可执行/不可用能力不进入契约
+            for op in capability.operations:
+                if op.tool is not None:
+                    added_tools[str(op.tool.name)] = op.tool
+                    added_operations.append(op.operation_id)
+        if not added_tools:
+            audit_logger.log_event(
+                thread_id=thread_id,
+                event="system_action",
+                action="step_reroute_kept",
+                step_index=step_index,
+                reason="no_executable_tools",
+            )
+            return decision, contract, scoped_tools
+
+        merged = dict(contract.tools)
+        merged.update(added_tools)
+        expanded_decision = RouteDecision(
+            route=decision.route,
+            intent=decision.intent,
+            capability_ids=decision.capability_ids + new_caps,
+            operation_ids=tuple(decision.operation_ids)
+            + tuple(added_operations),
+            allowed_tool_ids=tuple(merged.keys()),
+            memory_scopes=decision.memory_scopes,
+            registry_version=decision.registry_version,
+            index_version=decision.index_version,
+            reason=decision.reason,
+            audit={
+                **decision.audit,
+                "step_reroute": {
+                    "step_index": step_index,
+                    "added_capabilities": list(new_caps),
+                    "explicit": step_decision.audit.get("path") == "explicit",
+                },
+            },
+        )
+        expanded_contract = InvocationContract(
+            decision=expanded_decision,
+            tools=merged,
+            ttl_seconds=contract.ttl_seconds,
+        )
+        expanded_scoped = _dedupe_tools(
+            list(scoped_tools) + list(added_tools.values())
+        )
+        with _router_lock:
+            _turn_scopes[thread_id] = (
+                _turn_scopes[thread_id][0],
+                expanded_decision,
+                expanded_contract,
+                expanded_scoped,
+                scope_label,
+            )
+        audit_logger.log_event(
+            thread_id=thread_id,
+            event="system_action",
+            action="step_reroute_expanded",
+            step_index=step_index,
+            added_capabilities=list(new_caps),
+            added_tools=sorted(added_tools.keys()),
+            explicit=step_decision.audit.get("path") == "explicit",
+        )
+        return expanded_decision, expanded_contract, expanded_scoped
 
     # LangGraph 的固定边不会经过路由函数，单独维护每个会话的上一节点，
     # 让审计日志可以完整还原 START、条件分支、固定边和 END。
@@ -1126,6 +1267,10 @@ def create_agent_app(
         user_text = str(last_human.content) if last_human else ""
         decision, turn_contract, scoped_tools, scope_label = _turn_contract(
             thread_id, user_text
+        )
+        # 步骤级重路由：计划推进到需要契约外能力的新步骤时扩充授权
+        decision, turn_contract, scoped_tools = _maybe_step_reroute(
+            thread_id, state, decision, turn_contract, scoped_tools, scope_label
         )
         route_observation = _route_observation(
             user_text, actual_tools, scoped_tools

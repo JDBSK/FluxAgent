@@ -225,5 +225,76 @@ class TestDynamicCapabilitySwap(unittest.TestCase):
             self.assertIn("mcp_translate_text", bound)
 
 
+class TestStepLevelReroute(unittest.TestCase):
+    """步骤级重路由：多步计划推进到需要其他外部能力的新步骤时，
+    契约只增不删地扩充授权；伪造/未注册能力不能借步骤文本扩权。"""
+
+    def test_second_step_gains_new_capability_authorization(self):
+        from tests.eval.stub import counting_tool
+
+        counter: dict[str, int] = {}
+        cook = counting_tool("mcp_cooking_meals", counter)
+        stock = counting_tool("mcp_market_quotes", counter)
+        llm = _make_llm([
+            # planner：两步计划，第二步需要与首步不同的能力
+            AIMessage(content='["用 cooking meals 服务推荐晚餐", "用 market quotes 服务查询茅台股价"]'),
+            # agent 步骤 0：只能看到首步能力
+            [{"name": "mcp_cooking_meals", "args": {"value": "晚餐"}}],
+            # agent 步骤 1：此时步骤级重路由应已并入 market 能力
+            [{"name": "mcp_market_quotes", "args": {"value": "茅台"}}],
+            AIMessage(content="两步都完成了"),
+        ])
+        with patch("fluxagent.core.agent.get_provider", return_value=llm), \
+             patch("fluxagent.core.agent.MEMORY_DIR", tempfile.mkdtemp()):
+            app = create_agent_app(
+                tools=[cook, stock], enable_planner=True, require_approval=False
+            )
+            app.invoke({
+                "messages": [
+                    HumanMessage(
+                        content="先帮我用 cooking 服务推荐晚餐，然后再查询一下茅台的最新股价"
+                    )
+                ]
+            })
+        # 两个工具都被真实执行（第二步在扩权后才可能成功）
+        self.assertGreaterEqual(counter.get("mcp_cooking_meals", 0), 1)
+        self.assertGreaterEqual(counter.get("mcp_market_quotes", 0), 1)
+        # 第一次 agent 绑定：仅首步能力，market 未授权
+        first_bound = [t.name for t in llm.bind_tools.call_args_list[0].args[0]]
+        self.assertIn("mcp_cooking_meals", first_bound)
+        self.assertNotIn("mcp_market_quotes", first_bound)
+        # 最后一次 agent 绑定：market 已并入，且首步能力保持可用（只增不删）
+        last_bound = [t.name for t in llm.bind_tools.call_args_list[-1].args[0]]
+        self.assertIn("mcp_market_quotes", last_bound)
+        self.assertIn("mcp_cooking_meals", last_bound)
+
+    def test_step_text_cannot_expand_to_unregistered_capability(self):
+        from tests.eval.stub import counting_tool
+
+        counter: dict[str, int] = {}
+        cook = counting_tool("mcp_cooking_meals", counter)
+        llm = _make_llm([
+            # planner：第二步指向未注册的能力
+            AIMessage(content='["用 cooking meals 服务推荐晚餐", "用 wallstreet trading 服务购买美股"]'),
+            [{"name": "mcp_cooking_meals", "args": {"value": "晚餐"}}],
+            AIMessage(content="没有可用的交易服务，无法执行该步骤"),
+        ])
+        with patch("fluxagent.core.agent.get_provider", return_value=llm), \
+             patch("fluxagent.core.agent.MEMORY_DIR", tempfile.mkdtemp()):
+            app = create_agent_app(
+                tools=[cook], enable_planner=True, require_approval=False
+            )
+            app.invoke({
+                "messages": [
+                    HumanMessage(content="用 cooking 服务推荐晚餐")
+                ]
+            })
+        # 全程绑定列表从未出现未授权的外部工具（fail-closed：不扩权）
+        for call in llm.bind_tools.call_args_list:
+            names = [t.name for t in call.args[0]]
+            external = [n for n in names if n.startswith("mcp_")]
+            self.assertEqual(external, ["mcp_cooking_meals"])
+
+
 if __name__ == "__main__":
     unittest.main()
