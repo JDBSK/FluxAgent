@@ -627,6 +627,8 @@ def create_agent_app(
     _breaker = CircuitBreaker()
     # 每会话缓存本回合路由结果：(thread_id -> (user_text, decision, contract, scoped, label))
     _turn_scopes: dict[str, tuple] = {}
+    # 每会话最近用户请求（会话上下文路由救援用，指代轮"回到刚才的话题"）
+    _recent_user_turns: dict[str, list] = {}
     _router_lock = threading.RLock()
 
     def _always_tools() -> list[BaseTool]:
@@ -712,6 +714,8 @@ def create_agent_app(
 
         # 重算阶段不持锁：LLM 重排/远程 embedding 可能长时间阻塞，
         # 锁只保护缓存读写；并发重算幂等，后写覆盖。
+        with _router_lock:
+            recent = list(_recent_user_turns.get(thread_id, []))
         explicit = _match_capability_explicit(user_text, snapshot)
         always = _always_tools()
         if explicit is not None:
@@ -780,7 +784,16 @@ def create_agent_app(
                 contract = InvocationContract(decision=decision, tools={})
                 scoped = []
         else:
-            decision = _router.decide(user_text, snapshot)
+            decision = _router.decide(
+                user_text, snapshot, context_turns=recent or None
+            )
+            if decision.route in {"answer_without_tools", "clarify"} and recent:
+                audit_logger.log_event(
+                    thread_id=thread_id,
+                    event="system_action",
+                    action="route_context_rescue_attempted",
+                    recent_turns=len(recent),
+                )
             contract = _router.build_contract(decision, snapshot)
             label = ""
             # 常驻 builtin 工具并入契约：路由只决定"外部能力"的最小集合，
@@ -809,6 +822,11 @@ def create_agent_app(
         scoped = _dedupe_tools(scoped)
         with _router_lock:
             _turn_scopes[thread_id] = (user_text, decision, contract, scoped, label)
+            # 记录最近用户请求（含本回合），供下一回合的会话上下文救援
+            recent_list = _recent_user_turns.setdefault(thread_id, [])
+            if recent_list[-1:] != [user_text]:
+                recent_list.append(user_text)
+            del recent_list[:-3]
             # 容量上限：被放弃的会话（审批未恢复等）不无限泄漏
             while len(_turn_scopes) > 256:
                 _turn_scopes.pop(next(iter(_turn_scopes)))

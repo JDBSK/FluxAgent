@@ -57,4 +57,3 @@ _tmp_*.py
 
 # baseline worktree for before/after comparison
 .baseline-wt/
-_compare_runner.py

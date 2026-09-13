@@ -130,6 +130,7 @@ class TestHeuristicRerankerOrders(unittest.TestCase):
 
 class TestMemoryWriteSide(unittest.TestCase):
     def test_agent_writes_task_state_and_episodic_memory(self):
+        from fluxagent.capability.descriptors import OperationDescriptor
         from fluxagent.capability.providers import builtin_descriptors
         from fluxagent.core.agent import create_agent_app
         from fluxagent.core.tools.builtins import BUILTIN_TOOLS
@@ -247,6 +248,120 @@ class TestDenseIndexRoundtrip(unittest.TestCase):
                 index.search("股票 行情", provider, top_k=2),
                 loaded.search("股票 行情", provider, top_k=2),
             )
+
+
+
+
+class TestSessionContextRescue(unittest.TestCase):
+    def test_router_rescues_anaphoric_turn_with_context(self):
+        """指代轮（"回到刚才的话题"）单独检索 abstain，带会话上下文应路由回原能力。"""
+        registry = CapabilityRegistry()
+        registry.register(make_capability("cap.cooking", name="CookSvc", description="菜谱推荐做菜家常菜"))
+        registry.register(make_capability("cap.market", name="MarketSvc", description="股票行情证券数据"))
+        snapshot = registry.snapshot()
+        router = HybridRouter(embedding_provider=DeterministicEmbedding(dim=128))
+        router.rebuild_index(snapshot)
+
+        alone = router.decide("回到刚才的话题，帮我推荐明天的菜谱", snapshot)
+        with_context = router.decide(
+            "回到刚才的话题，帮我推荐明天的菜谱",
+            snapshot,
+            context_turns=["帮我推荐中餐菜谱，两个人吃", "股票行情怎么样"],
+        )
+        # 单独文本证据不足时不强制；带上下文必须路由回菜谱
+        if alone.route != "route":
+            self.assertEqual(with_context.route, "route")
+            self.assertEqual(with_context.capability_ids, ("cap.cooking",))
+            self.assertTrue(with_context.audit.get("context_rescue"))
+        else:
+            self.assertEqual(with_context.capability_ids, ("cap.cooking",))
+
+    def test_context_rescue_does_not_perturb_confident_routes(self):
+        """已有明确路由的请求不受上下文救援扰动。"""
+        registry = CapabilityRegistry()
+        registry.register(make_capability("cap.cooking", name="CookSvc", description="菜谱推荐做菜"))
+        registry.register(make_capability("cap.market", name="MarketSvc", description="股票行情证券"))
+        snapshot = registry.snapshot()
+        router = HybridRouter(embedding_provider=DeterministicEmbedding(dim=128))
+        router.rebuild_index(snapshot)
+        plain = router.decide("查询贵州茅台的股票行情", snapshot)
+        with_context = router.decide(
+            "查询贵州茅台的股票行情", snapshot,
+            context_turns=["帮我推荐中餐菜谱"],
+        )
+        self.assertEqual(plain.capability_ids, with_context.capability_ids)
+        self.assertNotIn("context_rescue", with_context.audit)
+
+    def test_agent_two_turn_anaphoric_routing(self):
+        """agent 两轮会话：第二轮指代轮路由回第一轮能力。"""
+        from langchain_core.tools import StructuredTool
+
+        from fluxagent.capability.descriptors import (
+            CapabilityDescriptor,
+            OperationDescriptor,
+            RiskLevel,
+        )
+        from fluxagent.capability.providers import builtin_descriptors
+        from fluxagent.core.agent import create_agent_app
+
+        def _run(value: str = "") -> str:
+            return "菜谱执行结果"
+
+        cooking = StructuredTool.from_function(
+            func=_run, name="mcp_cooking_meals",
+            description="推荐中餐菜谱和膳食计划",
+            metadata={"capability": "cooking", "kind": "mcp"},
+        )
+        store = MemoryStore()
+        llm = MagicMock()
+        llm.bind_tools.return_value = llm
+        llm.invoke.side_effect = [
+            AIMessage(content="", tool_calls=[
+                {"name": "mcp_cooking_meals", "args": {"value": "x"}, "id": "c1"}
+            ]),
+            AIMessage(content="第一轮菜谱回答"),
+            AIMessage(content="回到菜谱话题的第二轮回答"),
+        ] + [AIMessage(content="兜底")] * 10
+
+        registry = CapabilityRegistry()
+        for descriptor in builtin_descriptors(
+            __import__("fluxagent.core.tools.builtins", fromlist=["BUILTIN_TOOLS"]).BUILTIN_TOOLS
+        ):
+            registry.register(descriptor)
+        op = OperationDescriptor(
+            capability_id="mcp.cooking",
+            name="mcp_cooking_meals",
+            operation_id="mcp.cooking/mcp_cooking_meals",
+            description="推荐中餐菜谱和膳食计划",
+            input_schema={"type": "object", "properties": {"value": {"type": "string"}}},
+            side_effect_level=RiskLevel.READ,
+            tool=cooking,
+        )
+        registry.register(
+            CapabilityDescriptor(
+                capability_id="mcp.cooking",
+                version="1",
+                kind="mcp",
+                name="cooking",
+                description="推荐中餐菜谱和膳食计划",
+                aliases=("cooking", "菜谱"),
+                operations=(op,),
+            )
+        )
+        with patch("fluxagent.core.agent.get_provider", return_value=llm),              patch("fluxagent.core.agent.MEMORY_DIR", tempfile.mkdtemp()):
+            app = create_agent_app(
+                capability_registry=registry,
+                memory_store=store,
+                enable_planner=False,
+                require_approval=False,
+            )
+            config = {"configurable": {"thread_id": "anaphora-test"}}
+            app.invoke({"messages": [HumanMessage(content="帮我推荐中餐菜谱")]}, config)
+            app.invoke({"messages": [HumanMessage(content="回到刚才的话题，再推荐一个菜")]}, config)
+            # 第二轮（无词法信号的指代轮）经上下文救援路由回 cooking：
+            # LLM 第二次被调用时 bind_tools 的列表里应有 cooking 工具
+            second_call_tools = [t.name for t in llm.bind_tools.call_args_list[1].args[0]]
+            self.assertIn("mcp_cooking_meals", second_call_tools)
 
 
 if __name__ == "__main__":

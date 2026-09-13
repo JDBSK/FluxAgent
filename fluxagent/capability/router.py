@@ -122,7 +122,7 @@ class HeuristicReranker:
         # 只做过滤），避免词面重打分破坏 BM25 的 IDF 排序（指标实测会掉 11 个点）
         self.order_by = order_by
 
-    def rerank(self, query: str, candidates: Sequence[Candidate]) -> List[Tuple[Candidate, float]]:
+    def rerank(self, query: str, candidates: Sequence[Candidate], context_turns: Optional[Sequence[str]] = None) -> List[Tuple[Candidate, float]]:
         from .retrieval import tokenize
 
         if not candidates:
@@ -208,10 +208,10 @@ class LLMReranker:
         self.fallback = fallback or HeuristicReranker()
         self.last_fallback_reason = ""
 
-    def rerank(self, query: str, candidates: Sequence[Candidate]) -> List[Tuple[Candidate, float]]:
+    def rerank(self, query: str, candidates: Sequence[Candidate], context_turns: Optional[Sequence[str]] = None) -> List[Tuple[Candidate, float]]:
         if not candidates:
             return []
-        prompt = self._build_prompt(query, candidates)
+        prompt = self._build_prompt(query, candidates, context_turns=context_turns)
         try:
             response = self.chat_model.invoke(prompt)
             text = str(getattr(response, "content", response))
@@ -225,19 +225,31 @@ class LLMReranker:
             return self.fallback.rerank(query, candidates)
 
     @staticmethod
-    def _build_prompt(query: str, candidates: Sequence[Candidate]) -> str:
+    def _build_prompt(
+        query: str,
+        candidates: Sequence[Candidate],
+        context_turns: Optional[Sequence[str]] = None,
+    ) -> str:
         lines = [
             "你是严格的能力路由器。根据用户请求，从候选能力中选择至多一个，"
             "只在证据充分时选择；不确定必须选 none。\n",
             f"用户请求: {query}\n",
-            "候选能力（编号|ID|描述|适用意图|输入必需槽位）:",
         ]
+        if context_turns:
+            # 会话近期请求：帮助解析"回到刚才的话题"等指代表达
+            recent = " | ".join(str(t)[:80] for t in context_turns[-2:])
+            lines.append(f"会话近期请求（仅供理解指代，不作为独立依据）: {recent}\n")
+        lines.append("候选能力（编号|ID|描述|适用意图|输入必需槽位）:")
         for index, candidate in enumerate(candidates):
             operation = candidate.operation
             slots = ",".join(operation.required_slots) if operation else ""
+            # 能力边界必须让 LLM 可见：负例（明确排除的场景）是路由判定的
+            # 关键依据，缺失它会导致"比特币→股票"类边界外请求被错配
+            negatives = ",".join(candidate.capability.negative_examples[:4])
+            negative_note = f" | 排除(应选none): {negatives}" if negatives else ""
             lines.append(
                 f"{index}|{candidate.capability_id}|{candidate.text[:120]}|"
-                f"{','.join(candidate.capability.intents)}|{slots}"
+                f"{','.join(candidate.capability.intents)}|{slots}{negative_note}"
             )
         lines.append(
             '只输出 JSON：{"selected": <编号或-1>, "reason": "<40字内>"}'
@@ -456,6 +468,7 @@ class HybridRouter:
         snapshot: RegistrySnapshot,
         *,
         explicit_capability: Optional[str] = None,
+        context_turns: Optional[Sequence[str]] = None,
     ) -> RouteDecision:
         text = str(user_text or "").strip()
         if self._index_registry_version != snapshot.version:
@@ -476,7 +489,20 @@ class HybridRouter:
         if resolved is not None:
             return self._decide_explicit(resolved, text, snapshot)
 
-        return self._decide_hybrid(text, snapshot)
+        decision = self._decide_hybrid(text, snapshot)
+        # 会话上下文救援：主决策 abstain/clarify 且本会话有近期请求时，
+        # 用近期文本辅助检索（解决"回到刚才的话题"类指代路由）。
+        # 只在证据不足时启用，不扰动已有明确路由。
+        if (
+            decision.route in {"answer_without_tools", "clarify"}
+            and context_turns
+        ):
+            rescue = self._decide_hybrid(text, snapshot, context_turns=context_turns)
+            if rescue.route == "route":
+                rescue.audit["context_rescue"] = True
+                return rescue
+            return decision
+        return decision
 
     # ---------- 显式路由 ----------
 
@@ -562,7 +588,13 @@ class HybridRouter:
 
     # ---------- Hybrid 路由 ----------
 
-    def _decide_hybrid(self, text: str, snapshot: RegistrySnapshot) -> RouteDecision:
+    def _decide_hybrid(
+        self,
+        text: str,
+        snapshot: RegistrySnapshot,
+        *,
+        context_turns: Optional[Sequence[str]] = None,
+    ) -> RouteDecision:
         if not self._docs_by_id:
             return self._decision(
                 route="answer_without_tools",
@@ -571,8 +603,12 @@ class HybridRouter:
                 reason="注册表为空：没有可路由的外部能力",
                 audit={"path": "hybrid"},
             )
+        # 会话上下文追加进检索查询（仅救援路径传入），提升指代轮的词法召回
+        retrieval_text = text
+        if context_turns:
+            retrieval_text = text + " " + " ".join(str(t) for t in context_turns[-2:])
         try:
-            bm25_ranking = self._bm25.search(text, top_k=self.top_k)
+            bm25_ranking = self._bm25.search(retrieval_text, top_k=self.top_k)
             rankings = [bm25_ranking]
             # 双路融合只在第二路具备真实语义信号时启用；确定性哈希向量本质
             # 是词面信息的向量重排，参与 RRF 只会稀释 BM25 的 IDF 信号
@@ -581,7 +617,7 @@ class HybridRouter:
 
             if not isinstance(self.embedding_provider, DeterministicEmbedding):
                 rankings.append(
-                    self._dense.search(text, self.embedding_provider, top_k=self.top_k)
+                    self._dense.search(retrieval_text, self.embedding_provider, top_k=self.top_k)
                 )
         except EmbeddingError as exc:
             return self._decision(
@@ -619,7 +655,11 @@ class HybridRouter:
                     operation=operation,
                 )
             )
-        ranked = self.reranker.rerank(text, candidates)
+        ranked = self.reranker.rerank(
+            retrieval_text if context_turns else text,
+            candidates,
+            context_turns=list(context_turns) if context_turns else None,
+        )
         if not ranked:
             return self._decision(
                 route="answer_without_tools",
