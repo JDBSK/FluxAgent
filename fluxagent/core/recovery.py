@@ -18,6 +18,7 @@ replan 是整表替换 task_plan（与创建计划同一语义），不是 appen
 from __future__ import annotations
 
 import json
+import re
 
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
@@ -89,15 +90,93 @@ class FailureDecision:
 
 
 def extract_tool_failure_texts(messages: Sequence[Any]) -> list[str]:
-    """取消息末尾连续 ToolMessage 文本。"""
-    texts: list[str] = []
-    for msg in reversed(messages):
-        if getattr(msg, "type", None) == "tool":
-            texts.append(str(getattr(msg, "content", "")))
+    """按最近调用批次的 ID 对账，缺失结果也视为失败。"""
+    batch = extract_tool_call_batch(messages)
+    if not batch:
+        return []
+    results = {
+        str(getattr(message, "tool_call_id", "")): message
+        for message in messages
+        if getattr(message, "type", None) == "tool"
+    }
+    texts = []
+    for call in batch:
+        call_id = str(call.get("id", ""))
+        result = results.get(call_id)
+        if result is None:
+            # 有调用没结果：按失败处理，绝不当作成功
+            texts.append("❌ missing_tool_result:" + call_id)
+        elif tool_result_failed(result):
+            texts.append("❌ " + str(result.content))
         else:
-            break
-    texts.reverse()
+            texts.append(json.dumps({"ok": True}, ensure_ascii=False))
     return texts
+
+
+def extract_tool_call_batch(messages: Sequence[Any]) -> list[dict]:
+    """返回"结果已回填但模型还没消化"的那个 tool_calls 批次。
+
+    只有序列末尾是 ToolMessage 时才存在待对账批次；模型已经用文本回答过
+    的批次视为已消化，返回空列表。
+    """
+    if not messages or getattr(messages[-1], "type", None) != "tool":
+        return []
+    for message in reversed(list(messages)[:-1]):
+        if getattr(message, "type", None) == "human":
+            return []
+        calls = getattr(message, "tool_calls", None) or []
+        if calls:
+            return list(calls)
+    return []
+
+
+def tool_result_failed(message: Any) -> bool:
+    """优先读取执行边界的结构化状态，再兼容旧工具文本。"""
+    if getattr(message, "status", None) == "error":
+        return True
+    metadata = getattr(message, "additional_kwargs", {}) or {}
+    outcome = metadata.get("fluxagent_result", {})
+    if isinstance(outcome, dict):
+        flag = _ok_flag(outcome.get("ok"))
+        if flag is not None:
+            return not flag
+    return is_tool_failure_text(str(getattr(message, "content", "")))
+
+
+def _ok_flag(value: Any) -> Optional[bool]:
+    """把工具自报的 ``ok`` 标记转成布尔；认不出就返回 None，绝不猜。
+
+    工具是手写代码，``ok`` 常常是字符串或 0/1 而不是 JSON 布尔值；
+    只认 ``is True/False`` 会把 ``{"ok":"false"}`` 当成成功（漏报失败）。
+    """
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "yes", "ok", "success", "成功"}:
+            return True
+        if normalized in {"false", "no", "fail", "failed", "error", "失败"}:
+            return False
+    return None
+
+
+def normalize_tool_result(message: Any) -> Any:
+    """保留原始内容，给执行结果附上统一状态。"""
+    failed = tool_result_failed(message)
+    metadata = dict(getattr(message, "additional_kwargs", {}) or {})
+    metadata["fluxagent_result"] = {"ok": not failed}
+    return message.model_copy(update={
+        "status": "error" if failed else "success",
+        "additional_kwargs": metadata,
+    })
+
+
+def tool_call_key(call: dict) -> str:
+    """重试去重只认相同工具和完全相同的参数。"""
+    return json.dumps([call.get("name"), call.get("args") or {}],
+                      ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def is_tool_failure_text(text: str) -> bool:
@@ -109,13 +188,19 @@ def is_tool_failure_text(text: str) -> bool:
             payload = json.loads(head)
         except (json.JSONDecodeError, TypeError):
             payload = None
-        if isinstance(payload, dict) and payload.get("ok") is False:
-            return True
-    if head.startswith(("❌", "权限拒绝", "越权拦截", "策略拒绝")):
+        if isinstance(payload, dict):
+            flag = _ok_flag(payload.get("ok"))
+            if flag is not None:
+                return not flag
+    if head.startswith(("❌", "权限拒绝", "越权拦截", "策略拒绝", "工具路由拒绝")):
         return True
-    if "Error" in s[:80]:
+    if re.match(r"(?:[\w.]*Error|error|exception|timeout)\s*[:：\n]", head, re.I):
         return True
-    if "policy_deny" in s or "hard_deny" in s:
+    if re.match(r"(?:保存|写入|读取|执行|安装|请求|调用|操作|连接|验证|删除|创建|下载)?失败(?:[：:，,。\s]|$)", head):
+        return True
+    if re.match(r"(?:policy_deny|hard_deny|route_mismatch|stale_contract)\b", head):
+        return True
+    if any(head.casefold().startswith(marker.casefold()) for marker in _PERMANENT_MARKERS):
         return True
     return False
 

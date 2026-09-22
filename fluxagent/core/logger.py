@@ -25,7 +25,7 @@ class JSONLEventLogger:
             raise ValueError("max_queue_size must be positive")
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
-        self.log_queue: "queue.Queue" = queue.Queue(maxsize=max_queue_size)
+        self.log_queue: "queue.Queue" = queue.Queue(maxsize=max_queue_size)  # 有界队列，超出队列大小时 log_event 会丢弃事件并计数
         self._state_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._closed = False
@@ -38,7 +38,7 @@ class JSONLEventLogger:
     def _write_loop(self):
         """Drain queued events to per-session JSONL files until the sentinel."""
         while True:
-            item = self.log_queue.get()
+            item = self.log_queue.get()  # 从队列取元素
             try:
                 if item is None:
                     return
@@ -86,18 +86,20 @@ class JSONLEventLogger:
             # 队列可能已满：先挤掉一个待写事件也要保证哨兵能入队，
             # 否则关闭路径会永久阻塞。
             try:
-                self.log_queue.put_nowait(None)
+                self.log_queue.put_nowait(None)  # 未完成任务计数器+1，哨兵入队
             except queue.Full:
                 try:
-                    self.log_queue.get_nowait()
-                    self.log_queue.task_done()
+                    self.log_queue.get_nowait()  # 取数据，队列为空不等待 直接报错
+                    self.log_queue.task_done()  # 标记刚get的任务完成（未完成任务计数器-1）
                 except (queue.Empty, ValueError):
                     pass
                 self.dropped_events += 1
-                self.log_queue.put_nowait(None)
-            self.log_queue.join()
-            self.worker_thread.join()
+                self.log_queue.put_nowait(None)  # 塞入队列、满了不等待直接报错
+
+            self.log_queue.join()  # 原地等待，直到所有被 get 出来的任务，全都调用过 task_done
+            self.worker_thread.join()  # 等待工作线程结束
 
 
 # 进程级单例：各模块 `from .logger import audit_logger` 共享同一写入器
+# 从内存队列到磁盘的写入是异步的，前台只做一次 in-memory put（O(1) 不阻塞）。
 audit_logger = JSONLEventLogger()

@@ -183,6 +183,13 @@ class TestSessionCommands(unittest.IsolatedAsyncioTestCase):
         self.app.aget_state.assert_awaited_once_with(self.config)
         self.app.get_state.assert_not_called()
 
+    async def test_legacy_permissions_command_is_not_exposed(self):
+        ok, msg = await handle_slash_command(
+            "/permissions", self.store, self.app, self.config
+        )
+        self.assertTrue(ok)
+        self.assertIn("未知命令", msg)
+
 
 class TestAsyncApprovalHelpers(unittest.IsolatedAsyncioTestCase):
     async def test_async_checkpointer_contract(self):

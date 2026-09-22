@@ -1,16 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Office sandbox tools with filesystem and subprocess hard limits.
+"""Office 沙箱工具，具有文件系统和子进程硬限制。
 
-The filesystem boundary is enforced with both lexical and resolved paths so
-prefix collisions, symlinks, and Windows junctions cannot escape OFFICE_DIR.
-Commands are parsed into argv and executed with ``shell=False``; shell syntax,
-absolute paths, URLs, and inline interpreter code are rejected before launch.
+文件系统边界通过词法和解析路径共同强制执行，以防止前缀冲突、符号链接和 Windows 连接逃逸 OFFICE_DIR。
+命令被解析为 argv 并使用 ``shell=False`` 执行；shell 语法、绝对路径、URL 和内联解释器代码在启动前被拒绝。
 
-Compound commands (``&&``, ``||``, ``|``, ``>``, ``>>``) are executed by a
-small built-in mini-shell: only built-in commands (echo/dir/ls/cat/type/
-grep/findstr/mkdir/md) may participate, so external interpreters never gain
-pipe/redirection composition. External allow-listed executables remain
-single-command only.
+聚合指令 (``&&``, ``||``, ``|``, ``>``, ``>>``) 通过一个小型内置 mini-shell 进行解析和执行：
+仅允许内置命令 (echo/dir/ls/cat/type/grep/findstr/mkdir/md) 参与，
+因此外部解释器永远无法获得管道/重定向组合。外部允许的可执行文件仍然是单命令执行。
 """
 
 from __future__ import annotations
@@ -24,6 +20,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -33,12 +30,24 @@ from .base import fluxagent_tool
 from ..config import OFFICE_DIR
 
 
-SYS_OS = platform.system()
-MAX_READ_BYTES = 1 * 1024 * 1024
-MAX_WRITE_BYTES = 1 * 1024 * 1024
+SYS_OS                 = platform.system()
+MAX_READ_BYTES         = 1 * 1024 * 1024
+MAX_WRITE_BYTES        = 1 * 1024 * 1024
 MAX_SHELL_OUTPUT_BYTES = 1 * 1024 * 1024
-SHELL_TIMEOUT_SECONDS = 60
-MAX_DIRECTORY_ENTRIES = 1000
+SHELL_TIMEOUT_SECONDS  = 60
+MAX_DIRECTORY_ENTRIES  = 1000
+
+_PATH_LOCKS_GUARD = threading.Lock()   # 互斥锁
+_PATH_LOCKS: dict[str, threading.RLock] = {}  # 路径锁字典
+_WORKSPACE_SHELL_LOCK = threading.RLock()  # 全局 shell 执行锁，避免并发执行导致的输出混乱
+
+
+def _path_lock(path: str) -> threading.RLock:
+    """创建或获取路径锁，确保同一文件/目录的并发访问安全。"""
+    key = os.path.normcase(os.path.realpath(path))
+    # 使用全局锁保护路径锁字典，避免并发创建冲突
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.RLock())
 
 _ALLOWED_EXECUTABLES = frozenset(
     {
@@ -47,6 +56,8 @@ _ALLOWED_EXECUTABLES = frozenset(
         "python", "python.exe", "python3", "python3.exe", "uv", "uv.exe",
     }
 )
+
+# 允许的内置命令：语义完全由本模块实现，外部二进制不参与管道/重定向
 _INLINE_CODE_FLAGS = {
     "python": {"-c", "-m"},
     "python.exe": {"-c", "-m"},
@@ -55,14 +66,15 @@ _INLINE_CODE_FLAGS = {
     "node": {"-e", "--eval", "-p", "--print"},
     "node.exe": {"-e", "--eval", "-p", "--print"},
 }
-_SHELL_META = re.compile(
-    r"[\r\n|&;<>`]|\$\(|\$\{|%[^%]+%|\$env:|\^|!", re.IGNORECASE)
+
+# 正则表达式预编译
+_SHELL_META = re.compile(r"[\r\n|&;<>`]|\$\(|\$\{|%[^%]+%|\$env:|\^|!", re.IGNORECASE)
 _URL_SCHEME = re.compile(r"(?i)\b(?:file|smb|ftp|https?)://")
 _WINDOWS_DRIVE = re.compile(r"(?i)^[a-z]:[\\/]")
 
 
 def _tool_error(code: str, message: str, *, retryable: bool = False) -> str:
-    """Return a stable JSON error envelope for ToolNode and recovery logic."""
+    """返回一个稳定的 JSON 错误包，用于 ToolNode 和恢复逻辑."""
     return json.dumps(
         {
             "ok": False,
@@ -75,7 +87,7 @@ def _tool_error(code: str, message: str, *, retryable: bool = False) -> str:
 
 
 def _inside(base: str, candidate: str) -> bool:
-    """Return whether candidate is inside base using path-component boundaries."""
+    """返回是否候选路径在基础路径内，使用路径组件边界."""
     try:
         return os.path.commonpath([base, candidate]) == base
     except (ValueError, OSError):
@@ -107,8 +119,8 @@ def _safe_argument_path(value: str) -> bool:
     if _URL_SCHEME.search(token):
         return False
     if token.startswith("-"):
-        # Options can carry paths in --key=value or attached forms such as
-        # git -C../outside. Validate the value instead of trusting the dash.
+        # 选项可通过 --key=value 形式或附加形式（如 git -C../outside）来指定路径。
+        # 验证数值，而非依赖于 shell 解析，避免绕过检查。
         if "=" in token:
             return _safe_argument_path(token.split("=", 1)[1])
         if ".." in token or "/" in token or "\\" in token:
@@ -421,7 +433,7 @@ def _run_compound(commands: list[_CompoundCommand]) -> tuple[int, str, str]:
 
 
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
-    """Terminate the subprocess and all descendants on Windows or POSIX."""
+    """终止给定的子进程及其所有后代进程，适用于 Windows 或 POSIX 系统."""
     if process.poll() is not None:
         return
     try:
@@ -454,7 +466,7 @@ def _read_limited(
     total: list[int],
     lock: threading.Lock,
 ) -> None:
-    """Read one process stream until EOF or the shared output cap is exceeded."""
+    """读取一个进程流直到 EOF 或共享输出上限被超过."""
     if stream is None:
         return
     try:
@@ -481,7 +493,7 @@ def _read_limited(
 
 
 def _run_command(args: list[str]) -> tuple[int, str, str]:
-    """Run argv with timeout, bounded output, and process-tree cleanup."""
+    """运行一个允许的 argv 命令，但不使用命令行 shell."""
     if args and args[0].startswith("__fluxagent_builtin_"):
         name = args[0].removeprefix("__fluxagent_builtin_").removesuffix("__")
         if name == "echo":
@@ -540,7 +552,7 @@ def _run_command(args: list[str]) -> tuple[int, str, str]:
 
 @fluxagent_tool
 def list_office_files(sub_dir: str = "") -> str:
-    """List files below the office root without following an escaping link."""
+    """列出office根目录下的文件，不跟随逃逸链接."""
     try:
         target_dir = _get_safe_path(sub_dir)
         if not os.path.exists(target_dir):
@@ -567,7 +579,7 @@ def list_office_files(sub_dir: str = "") -> str:
 
 @fluxagent_tool
 def read_office_file(filepath: str) -> str:
-    """Read at most one MiB from a regular file inside the office root."""
+    """从office根目录内的普通文件中读取最多1 MiB的数据."""
     try:
         target_path = _get_safe_path(filepath)
         if not os.path.exists(target_path):
@@ -586,23 +598,61 @@ def read_office_file(filepath: str) -> str:
 
 @fluxagent_tool
 def write_office_file(filepath: str, content: str, mode: str = "w") -> str:
-    """Create, replace, or append a bounded UTF-8 file inside the office root."""
+    """创建、替换或追加一个受限制的 UTF-8 文件在office根目录内."""
     try:
         if mode not in {"w", "a"}:
             return _tool_error("invalid_mode", "mode 参数必须是 'w' 或 'a'。")
         encoded = str(content).encode("utf-8")
         if len(encoded) > MAX_WRITE_BYTES:
             return _tool_error("payload_too_large", f"单次写入超过 {MAX_WRITE_BYTES} 字节限制。")
+
+        # --------- 使用获取锁保证路径安全，避免并发写入冲突 ---------
         target_path = _get_safe_path(filepath)
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        target_path = _get_safe_path(filepath)
-        if mode == "a" and os.path.exists(target_path):
-            if os.path.getsize(target_path) + len(encoded) > MAX_WRITE_BYTES:
-                return _tool_error("file_too_large", f"追加后文件将超过 {MAX_WRITE_BYTES} 字节限制。")
-        with open(target_path, mode, encoding="utf-8") as handle:
-            if mode == "a" and content and not content.startswith("\n"):
-                handle.write("\n")
-            handle.write(content)
+        lock = _path_lock(target_path)  # 获取路径锁，确保同一文件的并发写入安全
+        # with clock = lock.acquire(blocking=True)阻塞等待,退出with块自动释放锁
+        with lock:
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            target_path = _get_safe_path(filepath)
+            # 检查文件大小限制
+            if mode == "a" and os.path.exists(target_path):
+                if os.path.getsize(target_path) + len(encoded) > MAX_WRITE_BYTES:
+                    return _tool_error("file_too_large", f"追加后文件将超过 {MAX_WRITE_BYTES} 字节限制。")
+            # 写入文件
+            if mode == "a":
+                with open(target_path, "a", encoding="utf-8") as handle:
+                    if content and not content.startswith("\n"):
+                        handle.write("\n")
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            # 使用原子替换写入新文件，避免部分写入
+            else:
+                temp_name = ""
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        encoding="utf-8",
+                        dir=os.path.dirname(target_path),
+                        prefix=f".{os.path.basename(target_path)}.",
+                        suffix=".tmp",
+                        delete=False,
+                    ) as handle:
+                        temp_name = handle.name
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())  # 确保数据写入磁盘
+
+                    # 原子替换目标文件
+                    os.replace(temp_name, target_path)
+                    temp_name = ""
+                finally:
+                    if temp_name:
+                        try:
+                            os.unlink(temp_name)  # 确保临时文件被删除
+                        except FileNotFoundError:
+                            pass
+
+        # --------- 写入成功，返回提示信息 ---------
         action = "覆盖/新建" if mode == "w" else "追加"
         return f" ● 成功以 {action} 模式写入文件：{filepath} (共 {len(content)} 字符)"
     except PermissionError as exc:
@@ -612,7 +662,7 @@ def write_office_file(filepath: str, content: str, mode: str = "w") -> str:
 
 
 def _has_unquoted_operator(text: str) -> bool:
-    """Return whether & | > appears outside quotes in the command text."""
+    """返回是否 & | > 出现在引号外的命令文本中."""
     quote: str | None = None
     for char in text:
         if quote:
@@ -641,14 +691,15 @@ def _uses_compound_path(command: str) -> bool:
 
 @fluxagent_tool
 def execute_office_shell(command: str) -> str:
-    """Run one allow-listed argv command inside office without a command shell."""
+    """运行一个允许的 argv 命令，但不使用命令行 shell."""
     try:
-        if _uses_compound_path(command):
-            plan = _plan_compound(_tokenize_compound(command))
-            returncode, stdout, stderr = _run_compound(plan)
-        else:
-            args = _parse_command(command)
-            returncode, stdout, stderr = _run_command(args)
+        with _WORKSPACE_SHELL_LOCK:
+            if _uses_compound_path(command):
+                plan = _plan_compound(_tokenize_compound(command))
+                returncode, stdout, stderr = _run_compound(plan)
+            else:
+                args = _parse_command(command)
+                returncode, stdout, stderr = _run_command(args)
         if returncode != 0:
             return _tool_error("command_failed", f"命令退出码 {returncode}：{(stderr or stdout)[-1000:]}")
         output = (

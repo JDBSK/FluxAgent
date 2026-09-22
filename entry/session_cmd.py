@@ -39,7 +39,6 @@ async def handle_slash_command(
     store: SessionStore,
     app: Any,
     config: dict[str, Any],
-    permission_manager: Any = None,
 ) -> tuple[bool, str]:
     """Return (handled, message). If handled, caller must not send text to agent."""
     raw = (text or "").strip()
@@ -57,14 +56,6 @@ async def handle_slash_command(
 
         if cmd == "help":
             return True, help_text()
-
-        if cmd in {"permissions", "permission"}:
-            if permission_manager is None:
-                return True, "权限管理器未启用。"
-            if arg.strip().lower() in {"reset", "clear"}:
-                permission_manager.clear()
-                return True, "已清除本次运行和永久授权。"
-            return True, permission_manager.describe()
 
         if cmd == "session":
             cur = store.get_active()

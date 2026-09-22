@@ -14,6 +14,7 @@ from langchain_core.messages import ToolMessage
 
 from .context import TASK_CANCELLED
 from .logger import audit_logger
+from .permission_broker import ActionRecord, PermissionBroker
 from .policy import assess_tool_calls, render_policy_decision
 
 REJECT_NOTE = "用户拒绝执行该操作。请不要重试，向用户说明已取消。"
@@ -22,25 +23,92 @@ REJECT_NOTE = "用户拒绝执行该操作。请不要重试，向用户说明�
 def pending_approval(app, config: dict) -> Optional[list[dict[str, Any]]]:
     """图是否停在审批点。返回待批的 tool_calls，没停就返回 None。"""
     snapshot = app.get_state(config)
-    if not snapshot.next or "approval" not in snapshot.next:
+    if not snapshot.next:
         return None
+    
+    thread_id = config.get("configurable", {}).get("thread_id", "system_default")
+    broker = getattr(app, "permission_broker", None)
+    if not isinstance(broker, PermissionBroker):
+        broker = None
+    if "subagent_approval" in snapshot.next:
+        # subagent approval 是在子 Agent 里发起的，主 Agent 只管审批，不管执行。
+        records = broker.pending(thread_id) if broker is not None else []
+        return [_action_call(record) for record in records] or None
+    
+    if "approval" not in snapshot.next:
+        return None
+    
     messages = snapshot.values.get("messages") or []
     if not messages:
         return None
+    
     calls = getattr(messages[-1], "tool_calls", None)
-    return list(calls) if calls else None
+    return _register_main_actions(app, thread_id, list(calls)) if calls else None
 
 
 async def apending_approval(app, config: dict) -> Optional[list[dict[str, Any]]]:
     """Async variant for graphs compiled with an async checkpointer."""
     snapshot = await app.aget_state(config)
-    if not snapshot.next or "approval" not in snapshot.next:
+    if not snapshot.next:
+        return None
+    thread_id = config.get("configurable", {}).get("thread_id", "system_default")
+    broker = getattr(app, "permission_broker", None)
+    if not isinstance(broker, PermissionBroker):
+        broker = None
+    if "subagent_approval" in snapshot.next:
+        records = broker.pending(thread_id) if broker is not None else []
+        return [_action_call(record) for record in records] or None
+    if "approval" not in snapshot.next:
         return None
     messages = snapshot.values.get("messages") or []
     if not messages:
         return None
     calls = getattr(messages[-1], "tool_calls", None)
-    return list(calls) if calls else None
+    return _register_main_actions(app, thread_id, list(calls)) if calls else None
+
+
+def _action_call(record: ActionRecord) -> dict[str, Any]:
+    return {
+        "id": record.tool_call_id,
+        "name": record.tool_name,
+        "args": record.args,
+        "action_id": record.action_id,
+        "actor": record.actor,
+        "child_name": record.child_name,
+        "risk_level": record.risk_level,
+        "reason": record.reason,
+        "workspace_scope": record.workspace_scope,
+    }
+
+
+def _register_main_actions(app, thread_id: str, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    broker = getattr(app, "permission_broker", None)
+    if not isinstance(broker, PermissionBroker):
+        broker = None
+    if broker is None:
+        return calls
+    result = []
+    policy = getattr(app, "policy_config", None)
+    for call in calls:
+        existing = broker.find(
+            thread_id=thread_id,
+            tool_call_id=str(call.get("id") or ""),
+        )
+        if existing is None:
+            decision = assess_tool_calls([call], config=policy, require_approval=True)
+            assessment = decision.assessments[0]
+            existing = broker.register(
+                thread_id=thread_id,
+                tool_call_id=str(call.get("id") or ""),
+                tool_name=str(call.get("name") or ""),
+                args=call.get("args") or {},
+                actor="main_agent",
+                risk_level=assessment.level_name,
+                reason="; ".join(assessment.reasons[:4]),
+                workspace_scope="office",
+            )
+        result.append(_action_call(existing))
+    return result
 
 
 def describe_calls(tool_calls: list[dict[str, Any]]) -> str:
@@ -50,7 +118,9 @@ def describe_calls(tool_calls: list[dict[str, Any]]) -> str:
     for tc in tool_calls:
         args = tc.get("args") or {}
         rendered = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items()) or "无参数"
-        lines.append(f"  - {tc.get('name')}({rendered})")
+        actor = tc.get("child_name") or ("主 Agent" if tc.get("actor") == "main_agent" else "")
+        prefix = f"[{actor}] " if actor else ""
+        lines.append(f"  - {prefix}{tc.get('name')}({rendered})")
     return "\n".join(lines)
 
 
@@ -61,6 +131,13 @@ def approve_prepare(app, config: dict, tool_calls: Optional[list] = None) -> Non
     过程），如果 prepare 里就 invoke 掉，外层再 astream 会重复推进一次。
     """
     thread_id = config.get("configurable", {}).get("thread_id", "system_default")
+    broker = getattr(app, "permission_broker", None)
+    if not isinstance(broker, PermissionBroker):
+        broker = None
+    for call in tool_calls or []:
+        action_id = str(call.get("action_id") or "")
+        if action_id and broker is not None:
+            broker.approve(action_id)
     audit_logger.log_event(
         thread_id=thread_id, event="system_action", action="approval_granted",
         tools=[tc.get("name") for tc in (tool_calls or [])],
@@ -76,6 +153,21 @@ def reject_prepare(
     图才会走 tools 之后的边（progress→agent），而不是真去执行工具。
     """
     thread_id = config.get("configurable", {}).get("thread_id", "system_default")
+    broker = getattr(app, "permission_broker", None)
+    if not isinstance(broker, PermissionBroker):
+        broker = None
+    for call in tool_calls:
+        action_id = str(call.get("action_id") or "")
+        if action_id and broker is not None:
+            broker.reject(action_id)
+    if tool_calls and all(call.get("actor") == "subagent" for call in tool_calls):
+        audit_logger.log_event(
+            thread_id=thread_id,
+            event="system_action",
+            action="approval_denied",
+            tools=[tc.get("name") for tc in tool_calls],
+        )
+        return
     tool_msgs = [
         ToolMessage(content=reason, tool_call_id=tc["id"], name=tc.get("name", ""))
         for tc in tool_calls
@@ -94,6 +186,21 @@ async def areject_prepare(
 ) -> None:
     """Async rejection preparation for graphs using an async checkpointer."""
     thread_id = config.get("configurable", {}).get("thread_id", "system_default")
+    broker = getattr(app, "permission_broker", None)
+    if not isinstance(broker, PermissionBroker):
+        broker = None
+    for call in tool_calls:
+        action_id = str(call.get("action_id") or "")
+        if action_id and broker is not None:
+            broker.reject(action_id)
+    if tool_calls and all(call.get("actor") == "subagent" for call in tool_calls):
+        audit_logger.log_event(
+            thread_id=thread_id,
+            event="system_action",
+            action="approval_denied",
+            tools=[tc.get("name") for tc in tool_calls],
+        )
+        return
     tool_msgs = [
         ToolMessage(content=reason, tool_call_id=tc["id"], name=tc.get("name", ""))
         for tc in tool_calls

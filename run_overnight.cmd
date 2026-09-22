@@ -44,9 +44,9 @@ if errorlevel 1 (
     echo [FATAL] long-session memory regression failed, see artifacts\long_session_memory.log
     exit /b 1
 )
-python _real_corpus_check.py > artifactseal_corpus_check.log 2>&1
+python scratch\_real_corpus_check.py > artifacts\real_corpus_check.log 2>&1
 if errorlevel 1 (
-    echo [FATAL] real-corpus assembly smoke failed, see artifactseal_corpus_check.log
+    echo [FATAL] real-corpus assembly smoke failed, see artifacts\real_corpus_check.log
     exit /b 1
 )
 

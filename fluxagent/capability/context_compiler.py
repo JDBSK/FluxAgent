@@ -2,10 +2,8 @@
 """Context Compiler 与选择性记忆。
 
 核心语义：
-- 记忆不是"全文画像 + 全量历史"，而是按 scope / 相关性 / 敏感性 / TTL /
-  token 预算筛选后的结构化记录；
-- 每次模型调用前编译出不可变 ContextSnapshot，注入内容全部带来源 ID 和
-  选择原因，可审计、可测试"为什么进入 prompt"；
+- 记忆不是"全文画像 + 全量历史"，而是按 scope / 相关性 / 敏感性 /TTL/token 预算筛选后的结构化记录；  
+- 每次模型调用前编译出不可变 ContextSnapshot,注入内容全部带来源 ID 和选择原因，可审计、可测试"为什么进入 prompt";
 - Compiler 构造消息副本，不修改 checkpoint 中的原始消息对象；
 - 完整历史、旧工具结果、旧参数错误、未选中 Skill 文档默认不注入。
 """
@@ -15,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 
 # ---------- 记忆模型 ----------
@@ -33,6 +31,7 @@ SENSITIVITY_LEVELS = frozenset({"normal", "sensitive"})
 
 @dataclass(frozen=True)
 class MemoryRecord:
+    """一条记忆的数据结构。不可变，便于快照和审计。"""
     record_id: str
     scope: MemoryScope
     value: str
@@ -65,12 +64,12 @@ MEMORY_FILE_FORMAT = "1"
 
 
 class MemoryStore:
-    """线程安全的结构化记忆仓库。
+    """线程安全的结构化记忆仓库。保存、查询、删除记忆
 
-    冲突规则：同 (scope, key) 写入时旧记录被 superseded（保留可追溯），
+    冲突规则：同 (scope, key) 写入时旧记录被 superseded(保留可追溯),
     不做静默覆盖——查询永远返回最新版本。
 
-    持久化：构造时传入 persist_path 后，所有变更（add/forget/forget_prefix）
+    持久化：构造时传入 persist_path 后,所有变更(add/forget/forget_prefix)
     自动全量快照落盘（原子写），重启后 load() 恢复。未传 persist_path 时
     行为与纯内存仓库完全一致（测试与子 Agent 场景）。
     """
@@ -83,8 +82,7 @@ class MemoryStore:
         self.last_persist_error: str = ""
 
     def _auto_save(self) -> None:
-        """变更后落盘。失败不抛出（记忆写失败不阻断任务流），错误留存在
-        last_persist_error 供审计/测试检查。"""
+        """变更后落盘。失败不抛出(记忆写失败不阻断任务流),错误留存在last_persist_error 供审计/测试检查。"""
         if not self.persist_path:
             return
         try:
@@ -96,7 +94,7 @@ class MemoryStore:
     def save(self, path: str) -> None:
         """全量快照落盘（临时文件 + os.replace 原子写）。
 
-        敏感记录也写入：文件位于本地 workspace（与画像 markdown 同级），
+        敏感记录也写入：文件位于本地 workspace(与画像 markdown 同级），
         注入侧仍由 query 的敏感过滤把关，落盘不改变可见性语义。
         """
         import json
@@ -128,9 +126,9 @@ class MemoryStore:
         _atomic_write_json(path, payload)
 
     def load(self, path: str) -> int:
-        """启动恢复。文件缺失/损坏/格式不符返回 0（fail-open：记忆是可用性
+        """启动恢复。文件缺失/损坏/格式不符返回 0(fail-open:记忆是可用性
         数据而非安全边界，坏文件不阻断启动）；单条坏记录跳过不拖垮整体。
-        过期记录在加载时丢弃（不复活）；counter 恢复高水位防 record_id 碰撞。
+        过期记录在加载时丢弃(不复活);counter 恢复高水位防 record_id 碰撞。
         """
         import json
 
@@ -203,10 +201,12 @@ class MemoryStore:
         session_id: str = "",
         now: Optional[float] = None,
     ) -> MemoryRecord:
+        
         if "@@" in str(key or "") or "@@" in str(session_id or ""):
             # fail-closed：@@ 是会话命名空间分隔符，出现即拒绝，
             # 防止 (key="k@@a", session="b") 与 (key="k", session="a@@b") 碰撞
             raise ValueError('memory key/session_id 不允许包含 "@@"')
+        
         with self._lock:
             self._counter += 1
             # record_id 含 scope 前缀 + 会话命名空间：同 key 跨 scope 不互相覆盖，
@@ -248,10 +248,10 @@ class MemoryStore:
     ) -> List[MemoryRecord]:
         """按 scope + capability/intent 相关性 + 会话边界筛选；敏感记录默认排除。
 
-        会话边界（fail-closed）：
-        - 全局记录（session_id 为空，如画像/通用偏好）任何会话可见；
+        会话边界(fail-closed):
+        - 全局记录(session_id 为空，如画像/通用偏好）任何会话可见；
         - 会话级记录只在 session_id 完全一致时可见；调用方未提供会话上下文
-          （session_id=None）时会话级记录一律排除，防止跨会话泄漏。
+          (session_id=None)时会话级记录一律排除,防止跨会话泄漏。
         """
         with self._lock:
             candidates = list(self._records.values())
@@ -272,6 +272,7 @@ class MemoryStore:
                 expired_ids = {
                     record.record_id for record in candidates if record.is_expired(now)
                 }
+
         result: List[MemoryRecord] = []
         for record in candidates:
             if record.record_id in expired_ids:
@@ -306,6 +307,8 @@ class MemoryStore:
         return removed
 
     def forget_prefix(self, prefix: str) -> int:
+        """删除所有 record_id 以 prefix 开头的记录，返回删除数量.
+        作用是清理同一类记忆（如某个能力的全部记忆）或清理会话级记忆。"""
         with self._lock:
             stale = [rid for rid in self._records if rid.startswith(prefix)]
             for rid in stale:
@@ -321,16 +324,17 @@ class MemoryStore:
 
 
 class ProfileCompatProvider:
-    """兼容 Provider：把项目内 Markdown 用户画像转换成结构化记忆。
+    """兼容 Provider:把项目内 Markdown 用户画像转换成结构化记忆。
 
-    核心编译器不依赖 Markdown；本 Provider 只在装配时把现有画像"导入"为
-    USER_FACT 记录，之后写入仍走 save_user_profile 工具（保持既有行为）。
+    核心编译器不依赖 Markdown;本 Provider 只在装配时把现有画像"导入"为USER_FACT 记录,
+    之后写入仍走 save_user_profile 工具（保持既有行为）。
     """
 
     def __init__(self, profile_path: str) -> None:
         self.profile_path = str(profile_path)
 
     def load_into(self, store: MemoryStore) -> int:
+        """把 Markdown 用户画像导入 MemoryStore,返回导入的记录数。"""
         import os
         import re as _re
 
@@ -352,7 +356,7 @@ class ProfileCompatProvider:
                 continue
             store.add(
                 MemoryScope.USER_FACT,
-                f"{key}：{value}",
+                f"{key}:{value}",
                 key=f"profile.{key}",
                 source_id=f"user_profile.md#{key}",
             )
@@ -416,7 +420,7 @@ class CompilationContext:
 
 
 class ContextCompiler:
-    """把"该让模型看到什么"变成确定性、可审计的编译过程。
+    """决定本轮哪些记忆能进入模型上下文
 
     注入优先级（超预算时按此顺序裁剪尾部）：
       规则 > 契约 > 相关记忆 > 任务状态/失败事实 > skill 上下文 > 历史摘要
@@ -533,6 +537,7 @@ class ContextCompiler:
 
     @staticmethod
     def _injection_reason(record: MemoryRecord, context: CompilationContext) -> str:
+        """生成内存注入的原因说明。"""
         reasons = [f"scope={record.scope.value}"]
         if record.capability_tags and context.capability_ids:
             overlap = set(record.capability_tags) & set(context.capability_ids)
@@ -558,12 +563,10 @@ class ContextCompiler:
         return (
             "你是FluxAgent——一个透明且可控制的本地智能体。\n"
             "Rules:\n"
-            "1. Stay inside the office sandbox for files/shell.\n"
-            "2. 只使用本回合 [Invocation contract] 明确允许的工具；"
-            "没有列出任何工具时，直接用已有知识回答，不要编造或猜测工具。\n"
-            "3. When user states long-term preferences, call save_user_profile.\n"
-            "4. Never claim a tool was called or a file was written unless the "
-            "structured tool_call and ToolMessage result are present.\n"
+            "1. 对于文件/Shell 操作，请始终在办公沙箱内执行。\n"
+            "2. 只使用本回合 [Invocation contract] 明确允许的工具；没有列出任何工具时，直接用已有知识回答，不要编造或猜测工具.\n"
+            "3. 当用户指定长期偏好时，调用 `save_user_profile` 函数。\n"
+            "4. 除非存在结构化的 `tool_call` 和 `ToolMessage` 结果，否则切勿声称已调用某工具或已写入某文件。\n"
             "5. 工具参数错误或被拒绝后不要换参数重试；直接向用户说明原因。\n"
         )
 

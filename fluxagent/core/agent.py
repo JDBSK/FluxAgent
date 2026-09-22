@@ -18,6 +18,8 @@
 工作流 = 这张 StateGraph 状态图（有条件分支、有循环、有状态持久化）。
 """
 
+import asyncio
+import inspect
 import json
 import os
 import re
@@ -27,7 +29,7 @@ import time
 from typing import Any, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -64,16 +66,26 @@ from .context import (
 from .logger import audit_logger
 from .policy import SIDE_EFFECT_TOOLS, PolicyConfig, assess_tool_calls, build_policy_config, render_policy_decision
 from .provider import get_provider
+from .plan_router import classify_plan, plan_fast_path, planning_request
 from .recovery import (
     ACTION_ABORT,
     ACTION_REPLAN,
     ACTION_RETRY,
+    CLASS_BUDGET,
+    CLASS_EXHAUSTED,
+    CLASS_POLICY,
+    CLASS_TRANSIENT,
+    FailureDecision,
     any_tool_failure,
     build_replan_prompt,
     classify_failure,
+    extract_tool_call_batch,
     extract_tool_failure_texts,
     fallback_replan_steps,
     failed_step_action,
+    normalize_tool_result,
+    tool_call_key,
+    tool_result_failed,
     validate_replan_steps,
 )
 
@@ -117,22 +129,12 @@ _REDACT_HELP_TOKEN_RE = re.compile(r"help_token: [A-Za-z0-9_-]+", re.IGNORECASE)
 
 
 def _needs_plan(text: str) -> bool:
-    # 当前使用的是规则分类器，根据文本长度、动作数量、是否涉及多文件、是否需要工具等特征判断，减少简单请求的一次模型调用
-    # 更高级的方法是混合路由，就是先用规则分类器快速判断，再用小模型（如 gpt-3.5-turbo-mini）做二次确认，最后再决定是否规划
-    # 判断原理：如果文本长度超过60个字符，或者包含多个步骤关键词，则需要规划
-    """Rule-based plan router. Avoid an extra LLM hop just to decide planning."""
-    if not text:
-        return False
-    if len(text) > 60:
-        return True
-    multi_step = ["然后", "接着", "再", "并且", "之后", "先", "最后", "步骤", "依次"]
-    hits = sum(1 for kw in multi_step if kw in text)
-    if hits >= 2:
-        return True
+    """规则快筛的保守结果：只有明确复杂才是 True，模糊一律 False。
 
-    # 如果文本中包含高危操作关键词，并且至少出现一次，则需要规划
-    heavy = ["写", "创建", "删除", "修改", "部署", "重构", "执行", "运行", "清理", "整理", "生成"]
-    return any(kw in text for kw in heavy) and hits >= 1
+    混合路由（规则快筛 + 小模型）在 route_entry 之前完成，见 _resolve_entry_plan。
+    保留本函数是为了让既有评测入口 tests/eval/runners.py 直接测规则层。
+    """
+    return plan_fast_path(text) is True
 
 
 _UNVERIFIED_ACTION_CLAIMS = (
@@ -201,11 +203,10 @@ def _metadata_aliases(value: Any) -> set[str]:
 
 
 def _explicit_backend_hint(user_text: str) -> str:
-    """Extract a generic backend name when a request explicitly names one.
+    """当请求明确指定了后端名称时，提取该通用后端名称。
 
-    This intentionally knows only routing grammar ("use X MCP/Skill/service"),
-    never concrete service names.  It lets us fail closed when a named backend
-    is not loaded instead of silently exposing unrelated tools.
+    该组件刻意仅支持路由语法（“使用 X MCP/Skill/服务”），而绝不涉及具体服务名称。
+    它允许我们在指定后端未加载时以明确方式报错，而非静默地暴露无关工具。
     """
     text = str(user_text or "").strip()
     pattern = re.compile(
@@ -221,13 +222,7 @@ def _explicit_backend_hint(user_text: str) -> str:
 
 
 def _explicit_tool_scope(user_text: str, tools: list[BaseTool]) -> tuple[list[BaseTool], str]:
-    """Restrict model-visible tools when the user explicitly names a backend.
-
-    Binding every installed MCP at once leaves selection to fuzzy model
-    matching.  A direct request naming one capability is an unambiguous routing
-    instruction, so expose only that backend for the whole turn.  Unnamed
-    requests keep the existing all-tools behavior.
-    """
+    """根据用户输入和工具列表，确定明确的工具作用域。"""
     text = str(user_text or "").casefold()
     groups: dict[str, list[BaseTool]] = {}
     aliases: dict[str, set[str]] = {}
@@ -235,8 +230,7 @@ def _explicit_tool_scope(user_text: str, tools: list[BaseTool]) -> tuple[list[Ba
         metadata = getattr(tool, "metadata", None) or {}
         capability = str(metadata.get("capability") or "").strip()
         if not capability:
-            # Generic fallback for tools created outside our loaders: group by
-            # the MCP/Skill prefix, without naming any concrete service.
+            # 如果工具没有 capability 元数据，则尝试从名称中提取 MCP/Skill 组件，capability指的是能力的通用名称，而不是具体的工具名称
             name = str(tool.name)
             capability = name.split("_", 2)[1] if name.startswith("mcp_") else name
         groups.setdefault(capability, []).append(tool)
@@ -256,18 +250,15 @@ def _explicit_tool_scope(user_text: str, tools: list[BaseTool]) -> tuple[list[Ba
             ):
                 matches.append((len(normalized), capability))
     if matches:
-        # Longest alias wins; ties are ambiguous. Explicit routing then fails
-        # closed below so the model can ask for clarification instead of
-        # guessing between capabilities.
+        # 如果有多个匹配，选择最长的匹配；如果长度相同，则选择第一个匹配的能力
         matches.sort(reverse=True)
         best_len = matches[0][0]
         best = {capability for length, capability in matches if length == best_len}
         if len(best) == 1:
             capability = next(iter(best))
             return groups.get(capability, []), capability
-    # An explicit routing phrase with no matching loaded capability must fail
-    # closed.  Otherwise a request for an unavailable backend could fall back
-    # to an unrelated MCP merely because it is installed.
+        
+    # 如果没有明确匹配的能力，则尝试从用户输入中提取后端提示
     hint = _explicit_backend_hint(user_text)
     if hint:
         return [], hint
@@ -275,15 +266,19 @@ def _explicit_tool_scope(user_text: str, tools: list[BaseTool]) -> tuple[list[Ba
 
 
 def _routing_terms(value: Any) -> set[str]:
-    """Build language-agnostic lexical terms from capability metadata."""
-    text = str(value or "").casefold()
-    terms = set(re.findall(r"[a-z0-9][a-z0-9_.-]{1,}", text))
+    """建立一个高召回的词法索引，用于能力/工具路由。"""
+    # 英文处理
+    text = str(value or "").casefold()  # 大写转小写
+    terms = set(re.findall(r"[a-z0-9][a-z0-9_.-]{1,}", text))  # 提取英文/标识符词条，比如 `graph_transition`、`file-read`、`task_123`结果放进集合自动去重
+
+    # 中文处理
     for run in re.findall(r"[\u4e00-\u9fff]{2,}", text):
-        # CJK has no whitespace tokenizer; overlapping bigrams/trigrams keep
-        # this generic while allowing phrases such as ``中餐菜谱`` to match a
-        # metadata description containing ``菜谱``.
+        # CJK（中日韩）字符没有空格分词器；重叠的双字节/三字节词组保持这种通用性，
+        # 同时允许诸如 ``中餐菜谱`` 的短语与包含 ``菜谱`` 的元数据描述匹配。
         for size in (2, 3):
-            terms.update(run[i : i + size] for i in range(len(run) - size + 1))
+            terms.update(run[i : i + size] for i in range(len(run) - size + 1))  # 滑动窗口提取重叠 2-gram 和 3-gram
+
+    # 最后过滤长度小于2的词条
     return {term for term in terms if len(term) >= 2}
 
 
@@ -333,7 +328,7 @@ def _relevant_tool_subset(user_text: str, tools: list[BaseTool]) -> list[BaseToo
 
 
 def _route_observation(user_text: str, tools: list[BaseTool], selected: list[BaseTool]) -> dict[str, Any]:
-    """Return audit-safe evidence for a routing decision."""
+    """返回路由决策的详细信息，供日志和调试使用。"""
     query_terms = _routing_terms(user_text)
     groups: dict[str, set[str]] = {}
     for tool in tools:
@@ -360,7 +355,7 @@ def _route_observation(user_text: str, tools: list[BaseTool], selected: list[Bas
     )
     return {
         "query_terms": sorted(query_terms),
-        "candidates": [{"capability": cap, "score": score} for cap, score in ranked[:8]],
+        "candidates": [{"capability": cap, "score": score} for cap, score in ranked[:8]],  # 8个候选能力
         "selected_capabilities": selected_capabilities,
         "best_score": best,
         "score_margin": best - second,
@@ -369,7 +364,7 @@ def _route_observation(user_text: str, tools: list[BaseTool], selected: list[Bas
 
 
 def _tool_scope_for_turn(user_text: str, tools: list[BaseTool]) -> tuple[list[BaseTool], str]:
-    """Apply explicit routing first, then metadata retrieval for implicit asks."""
+    """先使用显式路由，然后使用元数据检索来处理隐式请求。"""
     scoped, label = _explicit_tool_scope(user_text, tools)
     if label:
         return scoped, label
@@ -377,7 +372,7 @@ def _tool_scope_for_turn(user_text: str, tools: list[BaseTool]) -> tuple[list[Ba
 
 
 def _latest_user_turn(messages: list[Any]) -> list[Any]:
-    """Return only the messages belonging to the most recent user turn."""
+    """只返回最近的用户回合及其后续消息，忽略之前的历史。"""
     for index in range(len(messages) - 1, -1, -1):
         if isinstance(messages[index], HumanMessage):
             return messages[index:]
@@ -411,7 +406,7 @@ def _install_call_from_user_request(messages: list[Any], user_text: str) -> Opti
 
 
 def _parse_plan(raw: str) -> list[dict[str, Any]]:
-    """Extract plan steps from LLM output; tolerate markdown fences."""
+    """从 LLM 输出中解析出 2-6 个步骤的计划，返回结构化列表。"""
     text = raw.strip()
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if match:
@@ -440,7 +435,10 @@ def _build_planner_prompt(goal: str) -> str:
         "规则:\n"
         "1. 只输出一个 JSON 字符串数组\n"
         "2. 每个步骤一个动作，不编号，不解释\n"
-        "3. 不要创造用户没有要求的步骤"
+        "3. 不要创造用户没有要求的步骤\n"
+        "4. 多条互不依赖、可以同时调查的工作线要合并成同一个步骤，并在该步骤中明确列出各工作线；"
+        "不要把它们拆成前后串行步骤\n"
+        "5. 跨工作线的综合判断放在并行调查步骤之后"
     )
 
 
@@ -457,6 +455,7 @@ def create_agent_app(
     policy: Optional[PolicyConfig] = None,
     hard_deny_critical: bool = True,
     permission_manager=None,
+    permission_broker=None,
     context_trigger_turns: int = CONTEXT_TRIGGER_TURNS,
     context_keep_turns: int = CONTEXT_KEEP_TURNS,
     *,
@@ -464,6 +463,10 @@ def create_agent_app(
     subagent_specs: Optional[list] = None,
     allow_dynamic_subagents: bool = True,
     dynamic_subagent_tools: Optional[List[BaseTool]] = None,
+    subagent_max_concurrent: int = 2,
+    subagent_max_queued: int = 8,
+    subagent_queue_timeout_seconds: float | None = None,
+    subagent_timeout_seconds: float = 120,
     capability_registry: Optional[CapabilityRegistry] = None,
     memory_store: Optional[MemoryStore] = None,
     context_compiler: Optional[ContextCompiler] = None,
@@ -486,7 +489,8 @@ def create_agent_app(
         budget: 运行时预算（LLM 调用次数/工具轮次/重规划次数/墙钟时间）。
         policy: 风险策略配置，None 则用默认策略。
         hard_deny_critical: 是否对 critical 级别工具调用硬拒绝。
-        permission_manager: 可选权限管理器，提供持续授权但不绕过 critical 硬拒绝。
+        permission_manager: 已弃用；保留参数仅兼容旧调用方。
+        permission_broker: 一次性动作审批账本；None 时使用进程内账本。
         context_trigger_turns: 上下文裁剪高水位，默认 20 个用户回合。
         context_keep_turns: 裁剪后的低水位，默认保留最近 10 个用户回合。
         enable_subagents: 是否注册 delegate_task 委派工具；None 表示自动判定
@@ -495,6 +499,10 @@ def create_agent_app(
         allow_dynamic_subagents: 是否允许主 Agent 临时定义新角色（默认允许）。
         dynamic_subagent_tools: 动态角色可选工具白名单；None 用默认只读集
             （列目录 + 读文件），空列表为纯分析。
+        subagent_max_concurrent: 同时运行的子 Agent 上限。
+        subagent_max_queued: 等待执行槽位的子任务上限。
+        subagent_queue_timeout_seconds: 子任务等待槽位的超时；None 时等于执行超时。
+        subagent_timeout_seconds: 单个子 Agent 获得槽位后的执行超时。
 
     Returns:
         编译后的 LangGraph 应用，支持 astream/aget_state/aupdate_state。
@@ -528,18 +536,46 @@ def create_agent_app(
         approval_tools=approval_tools,
         hard_deny_critical=hard_deny_critical,
     )
+    from .permission_broker import ActionStatus, PermissionBroker
+
+    permission_broker = permission_broker or PermissionBroker(":memory:")
 
     # 子 Agent 委派：保留显式 tools= 的旧行为；默认 CLI 工具集自动获得委派。
     # 显式传 enable_subagents=True/False 时以显式值为准。
     if enable_subagents is None:
         enable_subagents = tools is None or subagent_specs is not None
+    subagent_runner = None
     if enable_subagents:
         from .subagents import SubagentRunner
         runner = SubagentRunner(
             subagent_specs, provider_name=provider_name, model_name=model_name,
+            max_concurrent=subagent_max_concurrent,
+            max_queued=subagent_max_queued,
+            queue_timeout_seconds=subagent_queue_timeout_seconds,
+            timeout_seconds=subagent_timeout_seconds,
             allow_dynamic=allow_dynamic_subagents,
-            dynamic_tools=dynamic_subagent_tools, policy=policy_cfg)
-        actual_tools = actual_tools + [runner.as_tool()]
+            dynamic_tools=(actual_tools if dynamic_subagent_tools is None else dynamic_subagent_tools),
+            policy=policy_cfg,
+            permission_broker=permission_broker, checkpointer=checkpointer)
+        subagent_runner = runner
+        delegate_tool = runner.as_tool()  # 添加子 Agent 工具，用来让主agent委派任务给子 Agent
+        actual_tools = actual_tools + [delegate_tool]
+        if capability_registry is not None:
+            # 调用方传入 Registry 时，委派工具不在其描述集合内；必须补登记，
+            # 否则网关 find_by_operation 会把合法调用判为 route_mismatch
+            # （"工具未在注册表中登记"）。与 registry=None 分支
+            # descriptors_from_tools(actual_tools) 的登记结果保持一致。
+            for descriptor in descriptors_from_tools([delegate_tool]):
+                try:
+                    capability_registry.register(descriptor)
+                except RegistryError as exc:
+                    audit_logger.log_event(
+                        thread_id="system_default",
+                        event="system_action",
+                        action="capability_register_failed",
+                        capability=descriptor.capability_id,
+                        error=str(exc)[:200],
+                    )
 
     tool_names = [tool.name for tool in actual_tools]
     if len(tool_names) != len(set(tool_names)):
@@ -569,15 +605,20 @@ def create_agent_app(
         }),
         top_k=8,
     )
-    # 受约束 LLM 路由重排：设置 FLUXAGENT_ROUTER_MODEL 即启用；故障自动回退启发式
+
+
+    # 受约束 LLM 路由重排：设置 FLUXAGENT_ROUTER_MODEL 即启用；
+    # 故障自动回退启发式_router_model 为空时，保持启发式 reranker；不为空时，尝试用 LLM rerank 覆盖启发式 reranker
     _router_model = os.getenv("FLUXAGENT_ROUTER_MODEL", "").strip()
     if _router_model:
         try:
+            # .env中有设置时，使用候选重拍，RRF+LLM rerank，覆盖度门槛/排序模式保持一致，包含语义和启发式特征
             _router_chat = get_provider(
                 provider_name=os.getenv("DEFAULT_PROVIDER", "aliyun"),
                 model_name=_router_model,
             )
-            # fallback 接线：LLM 故障回退到与主 reranker 同配置的启发式，
+
+            # 降级备用方案：LLM 故障回退到与主 reranker 同配置的启发式，
             # 而不是裸默认实例（覆盖度门槛/排序模式保持一致）
             _router.reranker = LLMReranker(_router_chat, fallback=_router.reranker)
             audit_logger.log_event(
@@ -593,16 +634,46 @@ def create_agent_app(
                 action="router_llm_reranker_failed",
                 error=str(exc)[:200],
             )
-    # 步骤级重路由专用路由器：高召回词法路径——LLM 重排的保守 abstain 适合
-    # 用户主请求，但 planner 改写的短步骤文本词面弱、需要检索兜底；扩权精度
-    # 仍由覆盖度门槛与 Gateway 执行前校验把关
+
+    # 规划入口分类器：只给"规则快筛拿不准"的请求用，模型默认取 .env 的小模型
+    _plan_classifier_off = os.getenv(
+        "FLUXAGENT_PLAN_CLASSIFIER", "").strip().casefold() in {"0", "off", "false", "no"}
+    _plan_classifier_model = (
+        os.getenv("FLUXAGENT_PLAN_CLASSIFIER_MODEL", "").strip()
+        or os.getenv("DEFAULT_MODEL", "").strip()
+    )
+    plan_classifier = None
+    if not _plan_classifier_off and _plan_classifier_model:
+        try:
+            plan_classifier = get_provider(
+                provider_name=os.getenv(
+                    "FLUXAGENT_PLAN_CLASSIFIER_PROVIDER",
+                    os.getenv("DEFAULT_PROVIDER", "aliyun"),
+                ),
+                model_name=_plan_classifier_model,
+            )
+            audit_logger.log_event(
+                thread_id="system_default",
+                event="system_action",
+                action="plan_classifier_enabled",
+                model=_plan_classifier_model,
+            )
+        except Exception as exc:  # noqa: BLE001 - 分类器不可用时退回纯规则
+            audit_logger.log_event(
+                thread_id="system_default",
+                event="system_action",
+                action="plan_classifier_failed",
+                error=str(exc)[:200],
+            )
+
+    # 步骤级重路由专用路由器：高召回词法路径——LLM 重排的保守 abstain 适合用户主请求
+    # 但 planner 改写的短步骤文本词面弱、需要检索兜底；扩权精度仍由覆盖度门槛与 Gateway 执行前校验把关
     _step_router = HybridRouter(
         embedding_provider=_router.embedding_provider,
         reranker=HeuristicReranker(order_by="retrieval"),
     )
     # 索引持久化：registry 版本 + embedding tag + 索引格式版本三重匹配才复用，
-    # 否则重建并落盘。目录锚定在 MEMORY_DIR 内——测试把 MEMORY_DIR patch 到
-    # 临时目录时，持久化文件仍严格留在允许的目录边界内。
+    # 否则重建并落盘。目录锚定在 MEMORY_DIR 内——测试把 MEMORY_DIR patch 到临时目录时，持久化文件仍严格留在允许的目录边界内。
     _index_dir = os.path.join(MEMORY_DIR, "capability_index")
     if not _router.load_index(_index_dir, capability_registry.snapshot()):
         _router.rebuild_index(capability_registry.snapshot())
@@ -1065,22 +1136,26 @@ def create_agent_app(
                 retry_count=state.get("retry_count", 0),
                 replan_count=state.get("replan_count", 0),
             )
-            print(
-                f"[Graph] {source_label} -> {target_label}"
-                f" | status={state.get('task_status', '') or '-'}"
-                f" step={state.get('step_index', 0)}",
-                file=sys.stderr,
-                flush=True,
-            )
+
             if to_node == END:
                 last_graph_nodes.pop(thread_id, None)
             else:
                 last_graph_nodes[thread_id] = to_node
-            if to_node == "approval":
+            if to_node in {"approval", "subagent_approval"}:
                 approval_wait_started_at[thread_id] = time.time()
 
     def _instrument_node(name: str, node_fn):
         """记录固定边进入节点；条件边已在路由函数中记录。"""
+        if inspect.iscoroutinefunction(node_fn):
+            async def async_wrapped(state: AgentState, config: RunnableConfig | None = None):
+                with transition_lock:
+                    previous = last_graph_nodes.get(_thread_id(config))
+                if previous != name:
+                    _record_transition(state, config, previous, name)
+                return await node_fn(state, config)
+
+            return async_wrapped
+
         def wrapped(state: AgentState, config: RunnableConfig | None = None):
             with transition_lock:
                 previous = last_graph_nodes.get(_thread_id(config))
@@ -1133,9 +1208,58 @@ def create_agent_app(
                 user_text = str(message.content)
                 break
         gateway = _gateway_for(thread_id, user_text)
-        kept_calls: list[dict] = []
+        broker_claims: dict[str, str] = {}
+        approval_checked_calls: list[dict] = []
         rejected_messages: list[ToolMessage] = []
         for call in gate_calls:
+            call_id = str(call.get("id", ""))
+            decision = assess_tool_calls(
+                [call], config=policy_cfg, require_approval=require_approval
+            )
+            if not decision.needs_approval:
+                approval_checked_calls.append(call)
+                continue
+            action = permission_broker.find(
+                thread_id=thread_id, tool_call_id=call_id
+            )
+            if action is None:
+                content = json.dumps(
+                    {"ok": False, "error": {"code": "approval_missing", "message": "操作没有有效的单次审批记录。", "retryable": False}},
+                    ensure_ascii=False,
+                )
+            elif action.status == ActionStatus.SUCCEEDED:
+                content = action.result
+            elif action.status != ActionStatus.APPROVED:
+                content = json.dumps(
+                    {"ok": False, "error": {"code": "approval_not_granted", "message": f"审批状态为 {action.status.value}，未执行。", "retryable": False}},
+                    ensure_ascii=False,
+                )
+            elif not permission_broker.resource_is_current(action):
+                content = json.dumps(
+                    {"ok": False, "error": {"code": "resource_conflict", "message": "审批后目标文件发生变化，拒绝覆盖。", "retryable": False}},
+                    ensure_ascii=False,
+                )
+                if permission_broker.claim(action.action_id):
+                    permission_broker.fail(action.action_id, content, "resource_conflict")
+            elif permission_broker.claim(action.action_id):
+                broker_claims[call_id] = action.action_id
+                approval_checked_calls.append(call)
+                continue
+            else:
+                current = permission_broker.get(action.action_id)
+                if current is not None and current.status == ActionStatus.SUCCEEDED:
+                    content = current.result
+                else:
+                    content = json.dumps(
+                        {"ok": False, "error": {"code": "duplicate_execution", "message": "该动作已被消费，未重复执行。", "retryable": False}},
+                        ensure_ascii=False,
+                    )
+            rejected_messages.append(
+                ToolMessage(content=content, tool_call_id=call_id, name=str(call.get("name", "")))
+            )
+
+        kept_calls: list[dict] = []
+        for call in approval_checked_calls:
             verdict = gateway.validate(str(call.get("name", "")), call.get("args") or {})
             audit_logger.log_event(
                 thread_id=thread_id,
@@ -1147,6 +1271,11 @@ def create_agent_app(
             if verdict.ok:
                 kept_calls.append(call)
             else:
+                action_id = broker_claims.pop(str(call.get("id", "")), "")
+                if action_id:
+                    permission_broker.fail(
+                        action_id, verdict.to_tool_message_content(), verdict.status.value
+                    )
                 rejected_messages.append(
                     ToolMessage(
                         content=verdict.to_tool_message_content(),
@@ -1166,11 +1295,32 @@ def create_agent_app(
         # 熔断回报：执行失败计入连续失败，成功复位；失败写入 episodic 记忆
         produced = result_state.get("messages", []) if isinstance(result_state, dict) else []
         snapshot_now = capability_registry.snapshot()
+        successful = dict(state.get("successful_tool_calls") or {})
+        processed = list(state.get("processed_tool_call_ids") or [])
+        normalized: list[Any] = []
         for message in produced:
             if getattr(message, "type", None) != "tool":
+                normalized.append(message)
                 continue
-            tool_name = str(message.name)
-            failed = any_tool_failure([str(message.content)])
+            # 执行边界就地把结果规范化：内容原样保留，补统一状态，
+            # 后续进度判断读状态而不猜文本。
+            outcome = normalize_tool_result(message)
+            normalized.append(outcome)
+            tool_name = str(getattr(outcome, "name", ""))
+            failed = tool_result_failed(outcome)
+            call_id = str(getattr(outcome, "tool_call_id", "") or "")
+            action_id = broker_claims.get(call_id, "")
+            if action_id:
+                if failed:
+                    permission_broker.fail(action_id, str(outcome.content))
+                else:
+                    permission_broker.succeed(action_id, str(outcome.content))
+            if call_id and call_id not in processed:
+                processed.append(call_id)
+            if call_id and not failed:
+                successful[call_id] = tool_name
+            elif call_id:
+                successful.pop(call_id, None)
             gateway.record_execution(tool_name, success=not failed)
             if not failed:
                 continue
@@ -1178,7 +1328,7 @@ def create_agent_app(
             try:
                 memory_store.add(
                     MemoryScope.EPISODIC,
-                    f"工具 {tool_name} 执行失败：{str(message.content)[:120]}",
+                    f"工具 {tool_name} 执行失败：{str(outcome.content)[:120]}",
                     key=f"episodic:{thread_id}:{tool_name}:{int(time.time())}",
                     source_id="tools_node",
                     capability_tags=(
@@ -1190,8 +1340,9 @@ def create_agent_app(
                 )
             except Exception:  # noqa: BLE001 - 记忆写失败不阻断工具循环
                 pass
-        if rejected_messages:
-            result_state["messages"] = list(produced) + rejected_messages
+        result_state["messages"] = normalized + rejected_messages
+        result_state["successful_tool_calls"] = successful
+        result_state["processed_tool_call_ids"] = processed
         return result_state
 
     def approval_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
@@ -1203,7 +1354,7 @@ def create_agent_app(
             "approval_interrupts": int(state.get("approval_interrupts") or 0) + 1,
             "task_status": "waiting_approval",
         }
-        # 人工阅读和输入 y/s/a/n 的时间不属于 Agent 执行耗时，否则用户稍晚
+        # 人工阅读和输入 y/n 的时间不属于 Agent 执行耗时，否则用户稍晚
         # 批准就会在工具返回后被 300 秒墙钟预算误杀。
         run_started_at = float(state.get("run_started_at") or 0.0)
         if wait_started and run_started_at:
@@ -1213,13 +1364,56 @@ def create_agent_app(
         return updates
     llm = get_provider(provider_name=provider_name, model_name=model_name)
 
+    def _resolve_entry_plan(state: AgentState, config: RunnableConfig | None) -> dict:
+        """混合路由：规则快筛 -> 小模型确认；任何异常都退回保守的"不规划"。
+        分类器只回答"要不要显式计划"，不选工具、不碰权限、不执行动作。
+        """
+        messages = state.get("messages") or []
+        request  = planning_request(messages)   # 规划请求文本
+        verdict  = plan_fast_path(request)      # 规则快筛：True/False/None
+        source   = "rule"
+
+        # 如果规则无法确定，使用模型进行判断
+        if verdict is None:
+            # 无模型可用时，保守地不规划,交给主agent执行
+            if plan_classifier is None:
+                verdict, source = False, "rule_abstain"
+            # 有模型可用
+            else:
+                # 有模型可用，尝试调用
+                try:
+                    verdict = classify_plan(
+                        plan_classifier, request, messages, actual_tools,
+                        config={"callbacks": []},
+                    )
+                    source = "model"
+                # 有模型可用但调用失败，退回保守的"不规划"，并记录异常失败
+                except Exception as exc:
+                    audit_logger.log_event(
+                        thread_id=_thread_id(config),
+                        event="system_action",
+                        action="plan_classifier_fallback",
+                        error=str(exc)[:200],
+                    )
+                    verdict, source = False, "fallback"
+     
+        return {
+            "entry_needs_plan"  : bool(verdict),   # 是否需要规划
+            "entry_route_source": source,          # 判断路由来源：rule/model/fallback
+            "planning_request"  : request,         # 规划请求的文本内容
+        }
+
     def initialize_run_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
         """在新一轮用户请求开始时重置运行状态。taskplan/retrycount等记录都清零"""
         messages = state.get("messages") or []
         if not messages or not isinstance(messages[-1], HumanMessage):
-            return {}
+            # 恢复/续跑场景不重做入口判断，避免沿用上一轮的分类结果
+            return {
+                "entry_needs_plan": bool(state.get("task_plan")),
+                "entry_route_source": "resume",
+            }
         _reset_turn_scope(_thread_id(config))
-        return {
+        updates = {
             "current_task": "",
             "task_plan": [],
             "step_index": 0,
@@ -1243,7 +1437,169 @@ def create_agent_app(
             "context_chars_after_trim": 0,
             "summary_llm_calls": 0,
             "last_run_summary": {},
+            "successful_tool_calls": {},
+            "processed_tool_call_ids": [],
+            "attempted_tool_calls": {},
+            "subagent_runs": {},
+            "subagent_results": {},
+            "pending_action_ids": [],
         }
+        updates.update(_resolve_entry_plan(state, config))
+        return updates
+
+    async def subagents_node(
+        state: AgentState, config: RunnableConfig | None = None
+    ) -> dict:
+        """Run one delegation batch concurrently and resume child checkpoints."""
+        if subagent_runner is None:
+            return {
+                "messages": [],
+                "task_status": TASK_FAILED,
+                "last_failure_class": "subagent_unavailable",
+                "last_failure_note": "子 Agent 运行器未启用。",
+            }
+        messages = state.get("messages") or []
+        calls = list(getattr(messages[-1], "tool_calls", None) or []) if messages else []
+        delegate_calls = [call for call in calls if call.get("name") == "delegate_task"]
+        deferred_calls = [call for call in calls if call.get("name") != "delegate_task"]
+        stored_runs = dict(state.get("subagent_runs") or {})
+        completed_runs = dict(state.get("subagent_results") or {})
+
+        def outcome_from_run(run: dict, *, reused: bool = False):
+            from .subagents import SubagentOutcome
+
+            return SubagentOutcome(
+                status=str(run.get("status") or "failed"),
+                result=str(run.get("result") or ""),
+                run_id=str(run.get("run_id") or ""),
+                child_thread_id=str(run.get("child_thread_id") or ""),
+                agent_name=str(run.get("agent_name") or ""),
+                role_source=str(run.get("role_source") or "dynamic"),
+                parent_run_id=str(run.get("parent_run_id") or ""),
+                action_ids=tuple(run.get("action_ids") or ()),
+                error_type=str(run.get("error_type") or ""),
+                truncated=bool(run.get("truncated")),
+                blocked_calls=tuple(run.get("blocked_calls") or ()),
+                reused=reused,
+            )
+
+        def canonical_request(call: dict) -> dict | None:
+            from .subagents import DelegationInput
+
+            try:
+                return DelegationInput.model_validate(call.get("args") or {}).model_dump(
+                    mode="json"
+                )
+            except Exception:  # runner will return the detailed validation error
+                return None
+
+        def reusable_run(request: dict | None) -> dict | None:
+            if request is None:
+                return None
+            for previous in completed_runs.values():
+                if (
+                    previous.get("status") == "completed"
+                    and previous.get("request") == request
+                ):
+                    return dict(previous)
+            return None
+
+        async def execute(call: dict) -> tuple[str, Any, dict]:
+            call_id = str(call.get("id") or "")
+            existing = stored_runs.get(call_id)
+            if existing and existing.get("status") not in {"running", "approval_required"}:
+                return call_id, outcome_from_run(existing), existing
+            cached = reusable_run(canonical_request(call)) if existing is None else None
+            if cached is not None:
+                audit_logger.log_event(
+                    thread_id=_thread_id(config),
+                    event="system_action",
+                    action="subagent_result_reused",
+                    run_id=cached.get("run_id", ""),
+                    agent_name=cached.get("agent_name", ""),
+                )
+                return call_id, outcome_from_run(cached, reused=True), cached
+            outcome, run = await subagent_runner.run_call(
+                call, config=config or {}, run_state=existing
+            )
+            run["error_type"] = outcome.error_type
+            run["truncated"] = outcome.truncated
+            run["blocked_calls"] = list(outcome.blocked_calls)
+            return call_id, outcome, run
+
+        results = await asyncio.gather(*(execute(call) for call in delegate_calls))
+        pending: list[str] = []
+        outcomes: dict[str, Any] = {}
+        for call_id, outcome, run in results:
+            stored_runs[call_id] = run
+            outcomes[call_id] = outcome
+            pending.extend(outcome.action_ids)
+            if outcome.status == "completed" and run.get("run_id"):
+                completed_runs[str(run["run_id"])] = dict(run)
+
+        if pending:
+            return {
+                "subagent_runs": stored_runs,
+                "subagent_results": completed_runs,
+                "pending_action_ids": list(dict.fromkeys(pending)),
+                "task_status": "waiting_approval",
+            }
+
+        tool_messages: list[ToolMessage] = []
+        for call in delegate_calls:
+            call_id = str(call.get("id") or "")
+            outcome = outcomes[call_id]
+            tool_messages.append(
+                ToolMessage(
+                    content=json.dumps(outcome.as_dict(), ensure_ascii=False),
+                    tool_call_id=call_id,
+                    name="delegate_task",
+                )
+            )
+            await subagent_runner.cleanup(outcome.child_thread_id)
+        for call in deferred_calls:
+            tool_messages.append(
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "ok": False,
+                            "error": {
+                                "code": "mixed_delegation_batch",
+                                "message": "同一批包含委派与普通工具；委派已执行，普通工具未执行。请根据子任务结果决定是否重新调用普通工具。",
+                                "retryable": False,
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    tool_call_id=str(call.get("id") or ""),
+                    name=str(call.get("name") or ""),
+                )
+            )
+        return {
+            "messages": tool_messages,
+            "subagent_runs": {},
+            "subagent_results": completed_runs,
+            "pending_action_ids": [],
+            "task_status": TASK_RUNNING,
+        }
+
+    def subagent_approval_node(
+        state: AgentState, config: RunnableConfig | None = None
+    ) -> dict:
+        """Marker node; the actual pause is interrupt_before this node."""
+        thread_id = _thread_id(config)
+        with transition_lock:
+            wait_started = approval_wait_started_at.pop(thread_id, None)
+        updates = {
+            "approval_interrupts": int(state.get("approval_interrupts") or 0) + 1,
+            "task_status": "waiting_approval",
+        }
+        run_started_at = float(state.get("run_started_at") or 0.0)
+        if wait_started and run_started_at:
+            updates["run_started_at"] = run_started_at + max(
+                0.0, time.time() - wait_started
+            )
+        return updates
 
     def _budget_fail_update(state: AgentState, reason: str) -> dict:
         """构造预算超限时的状态与当前计划更新。"""
@@ -1484,12 +1840,24 @@ def create_agent_app(
         )
         if enable_subagents:
             sys_prompt += (
-                "\n9. 复杂且可独立处理的阅读、分析任务可以调用 delegate_task 委派子 Agent。"
+                "\n9. 默认由你直接完成任务；不要仅因为存在多个文件或可并行步骤就委派。"
+                "只有子任务足够复杂，并且上下文隔离、专业分工或独立失败边界的收益明确高于额外模型调用成本时，"
+                "才调用 delegate_task。存在两个以上互不依赖的调查分支，且每个分支都需要多次工具调用和独立判断时，"
+                "优先委派并由你保留最终汇总；不同分支需要不同专业视角，"
+                "或全部原始结果进入主上下文会明显挤占最终综合判断空间。决定委派且存在两个以上互不依赖的子任务时，"
+                "应在同一响应中发出多个 delegate_task 以并行处理。只有互不依赖的平级子任务才能放在同一批；"
+                "有前后依赖的工作必须等本批结果返回并综合后，再决定下一批。"
+                "简单问答、单次读取、单工具动作和主图可直接批量调用工具完成的任务不要委派。"
                 "可使用预设角色；需要其他专长时，按 delegate_task 工具描述临时定义新角色"
                 "（instructions 定义职责与方法，tool_names 只选必要工具，留空为纯分析）。"
                 "只传必要背景与相对路径，不要发送整段历史或任何凭据。"
-                "子 Agent 默认只读，不能修改文件；不要声称子任务完成了修改。"
-                "必须检查返回 status；failed、timeout、step_limit、busy 或 rejected 都不代表完成。\n"
+                "子 Agent 的工具只能从当前主图工具中选择，不能扩权或递归委派。"
+                "需要人工审批的副作用会暂停子图；批准后由原子图使用原参数继续执行。"
+                "必须检查返回 status：只有 completed 表示子任务完成。"
+                "blocked、failed、timeout、step_limit、queue_timeout、queue_full 或 rejected 都不代表完成。"
+                "同批部分成功时保留成功结果，只重试未完成项，不要重新委派已完成项。\n"
+                "汇总多个子 Agent 的结果时，必须按用户指定的字段和判定条件重新核对证据；"
+                "不要因为整行文本不同，就断言其中没有共同字段。\n"
             )
         if scope_label:
             names = ", ".join(str(tool.name) for tool in scoped_tools)
@@ -1599,10 +1967,8 @@ def create_agent_app(
                     {**state, **state_updates, "task_status": TASK_DONE}
                 )
 
-        # A model can narrate a tool call instead of returning structured
-        # tool_calls. Never treat that narration as a completed side effect.
-        # Once this protocol error is detected, a later plain-text response is
-        # also not allowed to clear it; only a real ToolMessage can do that.
+        # 模型可叙述工具调用，而非返回结构化 tool_calls。不能将无工具调用的直接输出认为是已完成的副作用
+        # 一旦检测到此协议错误，后续以明文形式发送的响应不能用于清除该错误；只有真正的 ToolMessage 才能实现这一功能。
         protocol_retry = state.get("last_failure_class") == "model_protocol"
         if not response.tool_calls and (unverified_claim or protocol_retry):
             state_updates["task_status"] = TASK_RUNNING
@@ -1982,6 +2348,37 @@ def create_agent_app(
             max_replans=run_budget.max_replans,
             enable_replan=enable_replan,
         )
+
+        # 重试去重：同一工具 + 完全相同参数的调用失败两次后，再重试同样参数
+        # 不会带来新信息，改为换方案或终止。
+        attempted = dict(state.get("attempted_tool_calls") or {})
+        batch_keys = [tool_call_key(call)
+                      for call in extract_tool_call_batch(state.get("messages") or [])]
+        repeated = max((int(attempted.get(key) or 0) for key in batch_keys), default=0)
+        if decision.action == ACTION_RETRY and repeated >= 2:
+            note = "duplicate_retry_suppressed:" + ",".join(batch_keys)[:120]
+            audit_logger.log_event(
+                thread_id=thread_id,
+                event="system_action",
+                action="retry_suppressed_duplicate",
+                attempts=repeated,
+                failure_class=decision.failure_class,
+            )
+            if enable_replan and int(state.get("replan_count") or 0) < run_budget.max_replans:
+                decision = FailureDecision(
+                    ACTION_REPLAN, CLASS_EXHAUSTED, note,
+                    int(state.get("retry_count") or 0),
+                    int(state.get("replan_count") or 0) + 1,
+                )
+            else:
+                decision = FailureDecision(
+                    ACTION_ABORT, CLASS_EXHAUSTED, note,
+                    int(state.get("retry_count") or 0),
+                    int(state.get("replan_count") or 0),
+                )
+        for key in batch_keys:
+            attempted[key] = int(attempted.get(key) or 0) + 1
+        updates["attempted_tool_calls"] = attempted
         updates.update(
             {
                 "retry_count": decision.retry_count,
@@ -2096,13 +2493,9 @@ def create_agent_app(
             _record_transition(state, config, "initialize", target)
             return target
 
-        # 如果启用规划器且没有任务计划，则检查最近的 HumanMessage 是否需要规划
-        last_human = next(
-            (m for m in reversed(state["messages"])
-             if isinstance(m, HumanMessage)), None
-        )  # 获取最近的 HumanMessage
-        # 如果需要规划，则进入plannner节点，否则直接进入agent节点
-        target = "planner" if last_human and _needs_plan(last_human.content) else "agent"
+        # 入口判断已在 initialize 节点完成（规则快筛 + 必要时小模型确认），
+        # 这里只读结论：路由函数必须保持无副作用、可重放。
+        target = "planner" if state.get("entry_needs_plan") else "agent"
         _record_transition(state, config, "initialize", target)
         return target
 
@@ -2138,6 +2531,11 @@ def create_agent_app(
             return target
         last_msg = state["messages"][-1]
         tool_calls = getattr(last_msg, "tool_calls", []) or []
+        delegate_calls = [tc for tc in tool_calls if tc.get("name") == "delegate_task"]
+        if delegate_calls:
+            target = "subagents"
+            _record_transition(state, config, "agent", target)
+            return target
         thread_id = _thread_id(config)
         last_human = next(
             (m for m in reversed(state.get("messages") or []) if isinstance(m, HumanMessage)),
@@ -2156,8 +2554,6 @@ def create_agent_app(
             tool_calls,
             config=policy_cfg,
             require_approval=require_approval,
-            approval_checker=(
-                permission_manager.is_allowed if permission_manager else None),
         )
         if policy_decision.hard_deny:
             # 如果策略引擎判定有硬拒绝，则进入 policy_block 节点
@@ -2173,6 +2569,13 @@ def create_agent_app(
         # 如果策略引擎判定不需要审批，则进入 tools 节点
         target = "tools"
         _record_transition(state, config, "agent", target)
+        return target
+
+    def route_after_subagents(
+        state: AgentState, config: RunnableConfig | None = None
+    ) -> str:
+        target = "subagent_approval" if state.get("pending_action_ids") else "progress"
+        _record_transition(state, config, "subagents", target)
         return target
 
     def route_after_planning(state: AgentState, config: RunnableConfig | None = None) -> str:
@@ -2218,6 +2621,22 @@ def create_agent_app(
     workflow.add_node("planner", _instrument_node("planner", planner_node))  # 规划器节点
     workflow.add_node("agent", _instrument_node("agent", agent_node))  # 智能体节点
     workflow.add_node("approval", _instrument_node("approval", approval_node))  # 审批节点
+    def subagents_node_sync(
+        state: AgentState, config: RunnableConfig | None = None
+    ) -> dict:
+        return asyncio.run(subagents_node(state, config))
+
+    workflow.add_node(
+        "subagents",
+        RunnableLambda(
+            _instrument_node("subagents", subagents_node_sync),
+            afunc=_instrument_node("subagents", subagents_node),
+        ),
+    )
+    workflow.add_node(
+        "subagent_approval",
+        _instrument_node("subagent_approval", subagent_approval_node),
+    )
     workflow.add_node("policy_block", _instrument_node("policy_block", policy_block_node))  # 策略拦截节点
     workflow.add_node("tools", _instrument_node("tools", tools_node))  # 工具调用节点
     workflow.add_node("progress", _instrument_node("progress", progress_node))  # 进度更新节点
@@ -2226,6 +2645,7 @@ def create_agent_app(
     # 连边——先连固定边（无条件跳转）\一定转移
     workflow.add_edge(START, "initialize")       # 入口 → 初始化
     workflow.add_edge("approval", "tools")       # 批准 → 执行
+    workflow.add_edge("subagent_approval", "subagents")
     workflow.add_edge("policy_block", "progress")  # 硬拒 → 检查结果
     workflow.add_edge("tools", "progress")       # 执行完 → 检查结果
 
@@ -2241,12 +2661,18 @@ def create_agent_app(
         "agent", route_after_agent,
         {
             "approval": "approval",
+            "subagents": "subagents",
             "policy_block": "policy_block",
             "tools": "tools",
             "progress": "progress",
             "agent": "agent",
             END: END,
         },
+    )
+    workflow.add_conditional_edges(
+        "subagents",
+        route_after_subagents,
+        {"subagent_approval": "subagent_approval", "progress": "progress"},
     )
     workflow.add_conditional_edges(
         "planner", route_after_planning, {"agent": "agent", END: END}
@@ -2264,7 +2690,10 @@ def create_agent_app(
     )
 
     # 编译工作流为可执行应用
-    interrupt_nodes = ["approval"] if require_approval else []
+    interrupt_nodes = ["approval", "subagent_approval"] if require_approval else []
     app = workflow.compile(checkpointer=checkpointer,
                            interrupt_before=interrupt_nodes)
+    app.permission_broker = permission_broker
+    app.subagent_runner = subagent_runner
+    app.policy_config = policy_cfg
     return app

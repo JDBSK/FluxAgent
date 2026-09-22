@@ -14,10 +14,14 @@ from unittest.mock import patch, MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import ValidationError
 
 import fluxagent.core.subagents as sub
 from fluxagent.core.agent import create_agent_app
+from fluxagent.core.approval import apending_approval, approve_prepare, pending_approval
+from fluxagent.core.policy import PolicyConfig, RiskLevel
 
 
 @tool
@@ -54,6 +58,7 @@ def call(name, args, ident="call-1"):
 
 
 CONFIG = {"configurable": {"thread_id": "parent-session", "run_id": "parent-run"}}
+LOOKUP_READ_POLICY = PolicyConfig(tool_base_overrides={"lookup": RiskLevel.READ})
 
 
 class RegistryTests(unittest.TestCase):
@@ -76,8 +81,10 @@ class RegistryTests(unittest.TestCase):
             spec((sub.SubagentRunner().as_tool(),))
 
     def test_host_budgets_validate(self):
-        for kwargs in ({"max_concurrent": 0}, {"max_steps": 1},
+        for kwargs in ({"max_concurrent": 0}, {"max_queued": -1}, {"max_steps": 1},
                        {"timeout_seconds": float("inf")}, {"timeout_seconds": 0},
+                       {"queue_timeout_seconds": float("inf")},
+                       {"queue_timeout_seconds": 0},
                        {"max_result_chars": 0}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 sub.SubagentRunner(**kwargs)
@@ -112,7 +119,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         self.model.fn = lambda messages, config: (
             AIMessage(content="answer: "+messages[-1].content)
             if messages[-1].type == "tool" else call("lookup", {"value": "data"}))
-        runner = sub.SubagentRunner([spec((lookup,))])
+        runner = sub.SubagentRunner([spec((lookup,))], policy=LOOKUP_READ_POLICY)
         result = json.loads(await runner.as_tool().ainvoke(
             {"agent_name": "reader", "task": "find", "context": "necessary"}, config=CONFIG))
         self.assertEqual(result["status"], "completed")
@@ -126,8 +133,41 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"llm_input", "tool_call", "tool_result", "ai_message"} <= {e["event"] for e in events})
         actions = [e["action"] for e in events if e["event"] == "system_action"]
         self.assertEqual(actions, ["subagent_started", "subagent_completed"])
+        started = next(e for e in events if e.get("action") == "subagent_started")
+        self.assertEqual(started["task"], "find")
+        self.assertEqual(started["context"], "necessary")
+        self.assertEqual(started["instructions"], "Analyze the supplied task.")
+        self.assertEqual(started["execution_mode"], "独立可恢复子图，审批后原地继续")
+        completed = next(e for e in events if e.get("action") == "subagent_completed")
+        self.assertEqual(completed["result_summary"], "answer: found:data")
+        self.assertEqual(completed["returned_to"], "parent_agent")
         for event in events:
             self.assertIn(event["role_source"], ("registered", "dynamic"))
+
+    async def test_transient_provider_error_retries_then_recovers(self):
+        attempts = 0
+
+        def flaky(_messages, _config):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise RuntimeError("429 concurrent limit exceeded")
+            return AIMessage(content="recovered")
+
+        self.model.fn = flaky
+        result = json.loads(await sub.SubagentRunner([spec()]).arun(
+            "reader", "task", config=CONFIG
+        ))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result"], "recovered")
+        self.assertEqual(attempts, 3)
+
+    async def test_exhausted_provider_error_propagates(self):
+        self.model.fn = lambda _messages, _config: (
+            (_ for _ in ()).throw(RuntimeError("429 concurrent limit exceeded"))
+        )
+        with self.assertRaisesRegex(RuntimeError, "concurrent limit"):
+            await sub.SubagentRunner([spec()]).arun("reader", "task", config=CONFIG)
 
     async def test_fresh_context_and_child_config_each_call(self):
         runner = sub.SubagentRunner([spec()])
@@ -194,10 +234,46 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_graph_step_budget(self):
         self.model.fn = lambda m, c: call("lookup", {"value": "again"}, "loop-"+str(len(m)))
-        runner = sub.SubagentRunner([spec((lookup,))], max_steps=3)
+        runner = sub.SubagentRunner([spec((lookup,))], max_steps=3, policy=LOOKUP_READ_POLICY)
         result = json.loads(await runner.arun("reader", "loop", config=CONFIG))
         self.assertEqual(result["status"], "step_limit")
         self.assertLessEqual(len(self.model.calls), 3)
+
+    async def test_invalid_parameters_can_be_corrected_once_only(self):
+        attempts = 0
+
+        def correct_once(messages, config):
+            nonlocal attempts
+            if messages[-1].type == "tool":
+                attempts += 1
+                if attempts == 1:
+                    return call("lookup", {"wrong": "field"}, "bad-2")
+                return AIMessage(content="fixed")
+            return call("lookup", {"wrong": "field"}, "bad-1")
+
+        self.model.fn = correct_once
+        runner = sub.SubagentRunner([spec((lookup,))], policy=LOOKUP_READ_POLICY)
+        failed = json.loads(await runner.arun("reader", "fix args", config=CONFIG))
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(len(self.model.calls), 2)
+
+        self.model.calls.clear()
+        attempts = 0
+
+        def corrected(messages, config):
+            nonlocal attempts
+            if messages[-1].type == "tool":
+                attempts += 1
+                if attempts == 1:
+                    return call("lookup", {"value": "fixed"}, "good-2")
+                return AIMessage(content="fixed")
+            return call("lookup", {"wrong": "field"}, "good-1")
+
+        self.model.fn = corrected
+        completed = json.loads(await sub.SubagentRunner(
+            [spec((lookup,))], policy=LOOKUP_READ_POLICY
+        ).arun("reader", "fix args", config=CONFIG))
+        self.assertEqual(completed["status"], "completed")
 
     async def test_timeout_cancels_async_model_and_releases_slot(self):
         cancelled = asyncio.Event()
@@ -231,7 +307,7 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(await runner.arun("reader", "retry", config=CONFIG))["status"], "completed")
         self.assertIn("subagent_cancelled", str(self.logger.log_event.call_args_list))
 
-    async def test_shared_concurrency_bound_and_busy_response(self):
+    async def test_shared_concurrency_bound_queues_next_run(self):
         entered, release = asyncio.Event(), asyncio.Event()
         async def wait(m, c):
             entered.set()
@@ -241,14 +317,79 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
         runner = sub.SubagentRunner([spec()], max_concurrent=1)
         first = asyncio.create_task(runner.arun("reader", "first", config=CONFIG))
         await asyncio.wait_for(entered.wait(), 2)
+        second = asyncio.create_task(runner.arun("reader", "second", config=CONFIG))
         try:
-            busy = json.loads(await runner.arun("reader", "second", config=CONFIG))
-            self.assertEqual(busy["status"], "busy")
+            await asyncio.sleep(.05)
+            self.assertFalse(second.done())
             self.assertEqual(len(self.model.calls), 1)
         finally:
             release.set()
-            await first
+        first_result, second_result = await asyncio.gather(first, second)
+        self.assertEqual(json.loads(first_result)["status"], "completed")
+        self.assertEqual(json.loads(second_result)["status"], "completed")
+        self.assertEqual(len(self.model.calls), 2)
         self.assertEqual(json.loads(await runner.arun("reader", "third", config=CONFIG))["status"], "completed")
+
+    async def test_queue_timeout_only_fails_waiting_run(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def wait(m, c):
+            entered.set()
+            await release.wait()
+            return AIMessage(content="ok")
+
+        self.model.fn = wait
+        runner = sub.SubagentRunner(
+            [spec()], max_concurrent=1, queue_timeout_seconds=.05
+        )
+        first = asyncio.create_task(runner.arun("reader", "first", config=CONFIG))
+        await asyncio.wait_for(entered.wait(), 2)
+        waiting = json.loads(await runner.arun("reader", "second", config=CONFIG))
+        self.assertEqual(waiting["status"], "queue_timeout")
+        self.assertEqual(len(self.model.calls), 1)
+        release.set()
+        self.assertEqual(json.loads(await first)["status"], "completed")
+
+    async def test_bounded_queue_rejects_only_excess_run(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def wait(m, c):
+            entered.set()
+            await release.wait()
+            return AIMessage(content="ok")
+
+        self.model.fn = wait
+        runner = sub.SubagentRunner(
+            [spec()], max_concurrent=1, max_queued=1, queue_timeout_seconds=1
+        )
+        first = asyncio.create_task(runner.arun("reader", "first", config=CONFIG))
+        await asyncio.wait_for(entered.wait(), 2)
+        second = asyncio.create_task(runner.arun("reader", "second", config=CONFIG))
+        await asyncio.sleep(.02)
+        excess = json.loads(await runner.arun("reader", "third", config=CONFIG))
+        self.assertEqual(excess["status"], "queue_full")
+        release.set()
+        completed = await asyncio.gather(first, second)
+        self.assertEqual([json.loads(item)["status"] for item in completed], ["completed", "completed"])
+
+    async def test_runner_can_queue_across_separate_sync_event_loops(self):
+        async def finish_after_yield(messages, config):
+            await asyncio.sleep(.02)
+            return AIMessage(content="ok")
+
+        self.model.fn = finish_after_yield
+        runner = sub.SubagentRunner([spec()], max_concurrent=1)
+
+        async def batch(prefix):
+            return await asyncio.gather(
+                runner.arun("reader", prefix + "-1", config=CONFIG),
+                runner.arun("reader", prefix + "-2", config=CONFIG),
+            )
+
+        first = await asyncio.to_thread(lambda: asyncio.run(batch("first")))
+        second = await asyncio.to_thread(lambda: asyncio.run(batch("second")))
+
+        self.assertTrue(all(json.loads(item)["status"] == "completed" for item in first + second))
 
     async def test_parallel_invocations_use_different_execution_scopes(self):
         runner = sub.SubagentRunner([spec()], max_concurrent=2)
@@ -268,13 +409,14 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
                 if len(results) == 1:
                     self.assertEqual(results[-1].content, "fixture evidence")
                     return call("write_office_file", {"filepath": "forbidden.txt", "content": "bad"}, "write")
-                self.assertIn("not a valid tool", results[-1].content)
+                self.assertIn("subagent_policy_block", results[-1].content)
                 return AIMessage(content="Read evidence; write unavailable.")
             self.model.fn = flow
             with patch.object(sandbox_tools, "OFFICE_DIR", d):
                 result = json.loads(await sub.SubagentRunner().arun(
                     "code_reviewer", "Read notes.txt", config=CONFIG))
-            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["blocked_calls"][0]["tool"], "write_office_file")
             self.assertFalse((root / "forbidden.txt").exists())
 
     async def test_parent_skill_token_cannot_authorize_child(self):
@@ -301,7 +443,11 @@ class SubagentTests(unittest.IsolatedAsyncioTestCase):
                         return call("demo", {"mode": "run", "command": "echo hi", "help_token": token}, "run")
                     return AIMessage(content="completed")
                 self.model.fn = flow
-                answer = json.loads(await sub.SubagentRunner([spec((skill,))]).arun("reader", "task", config=CONFIG))
+                skill_policy = PolicyConfig(
+                    tool_base_overrides={skill.name: RiskLevel.READ})
+                answer = json.loads(await sub.SubagentRunner(
+                    [spec((skill,))], policy=skill_policy
+                ).arun("reader", "task", config=CONFIG))
                 self.assertEqual(answer["status"], "completed")
                 shell.invoke.assert_called_once()
                 audit_text = str(self.logger.log_event.call_args_list)
@@ -384,18 +530,64 @@ class ParentIntegrationTests(unittest.TestCase):
             app = create_agent_app(enable_planner=False, require_approval=False)
             app.invoke({"messages": [HumanMessage(content="hello")]}, config=CONFIG)
         self.assertIn("delegate_task", [t.name for t in parent.bind_tools.call_args.args[0]])
+        system_prompt = str(parent.invoke.call_args.args[0][0].content)
+        self.assertIn("不要仅因为存在多个文件或可并行步骤就委派", system_prompt)
+        self.assertIn("两个以上互不依赖的调查分支", system_prompt)
+        self.assertIn("每个分支都需要多次工具调用和独立判断时，优先委派", system_prompt)
+        self.assertIn("可并行本身不是委派理由", app.subagent_runner.as_tool().description)
         sub.get_provider.assert_not_called()
+
+    def test_caller_registry_gets_delegation_registered(self):
+        """CLI 主路径（main.py 传入预建 Registry）：delegate_task 必须补登记，
+        否则网关 find_by_operation 判 route_mismatch「工具未在注册表中登记」。"""
+        from fluxagent.capability.providers import builtin_descriptors
+        from fluxagent.capability.registry import CapabilityRegistry
+
+        registry = CapabilityRegistry()
+        for descriptor in builtin_descriptors([lookup]):
+            registry.register(descriptor)
+
+        class Parent:
+            def bind_tools(inner, tools):
+                inner.tools = tools
+                return inner
+            def invoke(inner, messages, config=None):
+                if messages[-1].type == "tool":
+                    result = json.loads(messages[-1].content)
+                    return AIMessage(content="registered: " + result["result"])
+                return call("delegate_task", {"agent_name": "code_reviewer",
+                                              "task": "review the log file"})
+        parent = Parent()
+        with patch("fluxagent.core.agent.get_provider", return_value=parent):
+            app = create_agent_app(capability_registry=registry,
+                                   enable_planner=False, require_approval=False)
+            result = app.invoke({"messages": [HumanMessage(content="review the log")]},
+                                config=CONFIG)
+        self.assertEqual(result["messages"][-1].content, "registered: finished")
+        self.assertIn("delegate_task", [t.name for t in parent.tools])
+        self.assertIsNotNone(registry.snapshot().find_by_operation("delegate_task"))
 
     def test_monitor_renders_subagent_lifecycle_without_markup_interpretation(self):
         from entry import monitor
+        from rich.panel import Panel
         with patch.object(monitor, "console") as console:
             monitor.render_event(json.dumps({
-                "event": "system_action", "action": "subagent_completed", "content": "[bold]data",
+                "event": "system_action", "action": "subagent_started",
+                "task": "[bold]data", "tools": ["read_office_file"],
                 "run_id": "child", "parent_run_id": "parent", "agent_name": "reader"}))
-        rendered = "\n".join(str(c.args[0]) for c in console.print.call_args_list)
+            monitor.render_event(json.dumps({
+                "event": "system_action", "action": "subagent_completed",
+                "result_summary": "answer: [bold]data", "duration_ms": 5,
+                "run_id": "child", "parent_run_id": "parent", "agent_name": "reader"}))
+
+        def flatten(call):
+            obj = call.args[0]
+            return str(obj.renderable) if isinstance(obj, Panel) else str(obj)
+
+        rendered = "\n".join(flatten(c) for c in console.print.call_args_list)
         self.assertIn("reader", rendered)
         self.assertIn("parent", rendered)
-        self.assertIn("subagent_completed", rendered)
+        self.assertIn("已返回主 Agent", rendered)
         self.assertIn("[bold]data", rendered)
 
 
@@ -410,7 +602,8 @@ class DynamicRoleTests(unittest.IsolatedAsyncioTestCase):
         self.model.fn = lambda messages, config: (
             AIMessage(content="evidence: "+messages[-1].content)
             if messages[-1].type == "tool" else call("lookup", {"value": "case"}))
-        runner = sub.SubagentRunner(dynamic_tools=[lookup])
+        runner = sub.SubagentRunner(
+            dynamic_tools=[lookup], policy=LOOKUP_READ_POLICY)
         result = json.loads(await runner.as_tool().ainvoke({
             "agent_name": "test_designer", "task": "Find a test case",
             "instructions": "Design failure tests with concrete evidence.",
@@ -526,22 +719,27 @@ class DynamicRoleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t.name for t in self.model.tools], ["read_office_file"])
 
     async def test_known_side_effect_tool_is_fail_closed_in_subagent_scope(self):
-        """FluxAgent 增强：宿主显式把已知副作用工具放进白名单时，子图内仍拒绝执行。"""
+        """需要审批的子图调用只形成提案，不执行副作用。"""
         from fluxagent.core.tools import sandbox_tools
+        args = {"filepath": "x.txt", "content": "no"}
+        self.model.fn = lambda messages, config: (
+            AIMessage(content="proposal returned")
+            if messages[-1].type == "tool" else
+            call("write_office_file", args, "w1"))
         runner = sub.SubagentRunner(dynamic_tools=[sandbox_tools.write_office_file])
-        result = json.loads(await runner.arun(
-            "writer", "task", config=CONFIG, instructions="Write files",
-            tool_names=["write_office_file"]))
-        self.assertEqual(result["status"], "completed")
-        # 工具被绑定了，但调用被策略闸门拒绝，返回结构化权限错误
-        self.model.fn = lambda m, c: (
-            AIMessage(content="blocked ok")
-            if m[-1].type == "tool" and "subagent_policy_block" in m[-1].content
-            else call("write_office_file", {"filepath": "x.txt", "content": "no"}, "w1"))
-        result2 = json.loads(await runner.arun(
-            "writer", "task", config=CONFIG, instructions="Write files",
-            tool_names=["write_office_file"]))
-        self.assertEqual(result2["status"], "completed")
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(sandbox_tools, "OFFICE_DIR", directory):
+            result = json.loads(await runner.arun(
+                "writer", "task", config=CONFIG, instructions="Write files",
+                tool_names=["write_office_file"]))
+            self.assertFalse((Path(directory) / "x.txt").exists())
+
+        self.assertEqual(result["status"], "approval_required")
+        self.assertEqual(len(result["action_ids"]), 1)
+        action = runner.permission_broker.get(result["action_ids"][0])
+        self.assertEqual(action.tool_name, "write_office_file")
+        self.assertEqual(action.args, args)
+        self.assertEqual(action.status.value, "pending")
 
     async def test_dangerous_args_hard_denied_inside_subagent(self):
         """FluxAgent 增强：读工具 + 越权路径参数在子图内被策略硬拒绝。"""
@@ -560,8 +758,285 @@ class DynamicRoleTests(unittest.IsolatedAsyncioTestCase):
                 result = json.loads(await sub.SubagentRunner().arun(
                     "reader", "task", config=CONFIG, instructions="Read files",
                     tool_names=["read_office_file"]))
-            self.assertEqual(result["status"], "completed")
-            self.assertTrue(any("策略硬拒绝" in c or "越权" in c for block in calls for c in block))
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["blocked_calls"][0]["tool"], "read_office_file")
+            self.assertTrue(any("策略拒绝" in c or "越权" in c for block in calls for c in block))
+
+
+class DelegatedApprovalIntegrationTests(unittest.TestCase):
+    def test_child_proposal_reaches_main_approval_and_executes_once(self):
+        from fluxagent.core.tools import sandbox_tools
+
+        args = {"filepath": "approved.txt", "content": "hello", "mode": "a"}
+        child = Model(lambda messages, config: (
+            AIMessage(content="write completed inside child")
+            if messages[-1].type == "tool" else
+            call("write_office_file", args, "child-write")))
+
+        class Parent:
+            def bind_tools(inner, tools):
+                inner.tools = tools
+                return inner
+
+            def invoke(inner, messages, config=None):
+                last = messages[-1]
+                if last.type == "tool" and last.name == "delegate_task":
+                    delegated = json.loads(last.content)
+                    self.assertEqual(delegated["status"], "completed")
+                    return AIMessage(content="parent summarized child result")
+                return call("delegate_task", {
+                    "agent_name": "writer",
+                    "task": "Append hello to approved.txt",
+                    "context": "The user explicitly requested this write.",
+                }, "delegate")
+
+        writer = sub.SubagentSpec(
+            "writer", "Propose file writes", "Prepare the requested file update.",
+            (sandbox_tools.write_office_file,),
+        )
+        config = {"configurable": {"thread_id": "delegated-approval"}}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("fluxagent.core.agent.MEMORY_DIR", directory), \
+             patch("fluxagent.core.agent.get_provider", return_value=Parent()), \
+             patch.object(sub, "get_provider", return_value=child), \
+             patch.object(sub, "audit_logger"), \
+             patch.object(sandbox_tools, "OFFICE_DIR", directory):
+            target = Path(directory) / "approved.txt"
+            target.write_text("seed", encoding="utf-8")
+            app = create_agent_app(
+                tools=[sandbox_tools.write_office_file],
+                checkpointer=MemorySaver(),
+                subagent_specs=[writer],
+                enable_subagents=True,
+                enable_planner=False,
+            )
+            app.invoke({"messages": [HumanMessage(
+                content="让 writer 子 Agent 给 approved.txt 追加 hello，并实际写入。"
+            )]}, config=config)
+
+            calls = pending_approval(app, config)
+            self.assertIsNotNone(calls)
+            self.assertEqual(calls[0]["name"], "write_office_file")
+            self.assertEqual(calls[0]["args"], args)
+            self.assertEqual(calls[0]["actor"], "subagent")
+            self.assertEqual(calls[0]["child_name"], "writer")
+            self.assertEqual(target.read_text(encoding="utf-8"), "seed")
+
+            approve_prepare(app, config, calls)
+            result = app.invoke(None, config)
+            self.assertEqual(result["messages"][-1].content, "parent summarized child result")
+            self.assertEqual(target.read_text(encoding="utf-8"), "seed\nhello")
+            app.invoke(None, config)
+            self.assertEqual(target.read_text(encoding="utf-8"), "seed\nhello")
+
+    def test_rejected_child_action_resumes_as_rejected_without_write(self):
+        from fluxagent.core.permission_broker import PermissionBroker
+        from fluxagent.core.tools import sandbox_tools
+
+        child = Model(lambda messages, config: (
+            AIMessage(content="cancelled")
+            if messages[-1].type == "tool" else
+            call("write_office_file", {"filepath": "rejected.txt", "content": "no"}, "write")))
+        writer = sub.SubagentSpec("writer", "Write files", "Perform the requested write.",
+                                  (sandbox_tools.write_office_file,))
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(sub, "get_provider", return_value=child), \
+             patch.object(sub, "audit_logger"), \
+             patch.object(sandbox_tools, "OFFICE_DIR", directory):
+            with PermissionBroker(Path(directory) / "state.sqlite3") as broker:
+                runner = sub.SubagentRunner([writer], permission_broker=broker,
+                                            checkpointer=MemorySaver())
+                delegated = call("delegate_task", {
+                    "agent_name": "writer", "task": "write rejected.txt",
+                }, "delegate").tool_calls[0]
+                outcome, run = asyncio.run(runner.run_call(
+                    delegated, config=CONFIG, run_state=None))
+                self.assertEqual(outcome.status, "approval_required")
+                self.assertTrue(broker.reject(outcome.action_ids[0]))
+                resumed, _ = asyncio.run(runner.run_call(
+                    delegated, config=CONFIG, run_state=run))
+                self.assertEqual(resumed.status, "rejected")
+                self.assertFalse((Path(directory) / "rejected.txt").exists())
+
+    def test_file_change_during_approval_fails_with_conflict(self):
+        from fluxagent.core.permission_broker import PermissionBroker
+        from fluxagent.core.tools import sandbox_tools
+
+        args = {"filepath": "conflict.txt", "content": "approved", "mode": "w"}
+        child = Model(lambda messages, config: (
+            AIMessage(content="done")
+            if messages[-1].type == "tool" else
+            call("write_office_file", args, "write")))
+        writer = sub.SubagentSpec("writer", "Write files", "Perform the requested write.",
+                                  (sandbox_tools.write_office_file,))
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(sub, "get_provider", return_value=child), \
+             patch.object(sub, "audit_logger"), \
+             patch.object(sandbox_tools, "OFFICE_DIR", directory):
+            target = Path(directory) / "conflict.txt"
+            target.write_text("before", encoding="utf-8")
+            with PermissionBroker(Path(directory) / "state.sqlite3") as broker:
+                runner = sub.SubagentRunner([writer], permission_broker=broker,
+                                            checkpointer=MemorySaver())
+                delegated = call("delegate_task", {
+                    "agent_name": "writer", "task": "replace conflict.txt",
+                }, "delegate").tool_calls[0]
+                outcome, run = asyncio.run(runner.run_call(
+                    delegated, config=CONFIG, run_state=None))
+                target.write_text("changed while waiting", encoding="utf-8")
+                self.assertTrue(broker.approve(outcome.action_ids[0]))
+                resumed, _ = asyncio.run(runner.run_call(
+                    delegated, config=CONFIG, run_state=run))
+                self.assertEqual(resumed.status, "failed")
+                self.assertEqual(target.read_text(encoding="utf-8"), "changed while waiting")
+
+    def test_parent_queues_third_delegation_and_keeps_concurrency_bound(self):
+        entered = 0
+        active = 0
+        max_active = 0
+        both_entered = asyncio.Event()
+
+        class ParallelChild(Model):
+            async def ainvoke(inner, messages, config=None):
+                nonlocal entered, active, max_active
+                entered += 1
+                active += 1
+                max_active = max(max_active, active)
+                if entered == 2:
+                    both_entered.set()
+                await asyncio.wait_for(both_entered.wait(), 1)
+                await asyncio.sleep(.02)
+                active -= 1
+                return AIMessage(content="child done")
+
+        class Parent:
+            def bind_tools(inner, tools):
+                return inner
+
+            def invoke(inner, messages, config=None):
+                if messages[-1].type == "tool":
+                    return AIMessage(content="all complete")
+                return AIMessage(content="", tool_calls=[
+                    {"name": "delegate_task", "args": {"agent_name": "reader", "task": "one"},
+                     "id": "one", "type": "tool_call"},
+                    {"name": "delegate_task", "args": {"agent_name": "reader", "task": "two"},
+                     "id": "two", "type": "tool_call"},
+                    {"name": "delegate_task", "args": {"agent_name": "reader", "task": "three"},
+                     "id": "three", "type": "tool_call"},
+                ])
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("fluxagent.core.agent.MEMORY_DIR", directory), \
+             patch("fluxagent.core.agent.get_provider", return_value=Parent()), \
+             patch.object(sub, "get_provider", return_value=ParallelChild()), \
+             patch.object(sub, "audit_logger"):
+            app = create_agent_app(tools=[], subagent_specs=[spec()],
+                                   enable_planner=False, require_approval=False)
+            result = app.invoke({"messages": [HumanMessage(content="run both")]}, config=CONFIG)
+        self.assertEqual(result["messages"][-1].content, "all complete")
+        self.assertEqual(entered, 3)
+        self.assertEqual(max_active, 2)
+
+    def test_parent_reuses_completed_subtask_instead_of_running_it_again(self):
+        child = Model(lambda messages, config: AIMessage(content="stable result"))
+
+        class Parent:
+            def bind_tools(inner, tools):
+                return inner
+
+            def invoke(inner, messages, config=None):
+                delegated = [
+                    message for message in messages
+                    if message.type == "tool" and message.name == "delegate_task"
+                ]
+                args = {"agent_name": "reader", "task": "inspect the same input"}
+                if not delegated:
+                    return call("delegate_task", args, "first-call")
+                if len(delegated) == 1:
+                    self.assertFalse(json.loads(delegated[-1].content)["reused"])
+                    return call("delegate_task", args, "repeated-call")
+                self.assertTrue(json.loads(delegated[-1].content)["reused"])
+                return AIMessage(content="reused successfully")
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("fluxagent.core.agent.MEMORY_DIR", directory), \
+             patch("fluxagent.core.agent.get_provider", return_value=Parent()), \
+             patch.object(sub, "get_provider", return_value=child), \
+             patch.object(sub, "audit_logger"):
+            app = create_agent_app(
+                tools=[], subagent_specs=[spec()], enable_planner=False,
+                require_approval=False,
+            )
+            result = app.invoke(
+                {"messages": [HumanMessage(content="repeat once to test idempotency")]},
+                config={"configurable": {"thread_id": "subtask-result-ledger"}},
+            )
+
+        self.assertEqual(result["messages"][-1].content, "reused successfully")
+        self.assertEqual(len(child.calls), 1)
+        self.assertEqual(len(result["subagent_results"]), 1)
+
+
+class AsyncDelegatedApprovalIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_sqlite_child_resume_and_terminal_cleanup(self):
+        from fluxagent.core.permission_broker import PermissionBroker
+        from fluxagent.core.tools import sandbox_tools
+
+        args = {"filepath": "async.txt", "content": "persisted", "mode": "w"}
+        child = Model(lambda messages, config: (
+            AIMessage(content="child finished")
+            if messages[-1].type == "tool" else
+            call("write_office_file", args, "child-write")))
+
+        class Parent:
+            def bind_tools(inner, tools):
+                return inner
+
+            def invoke(inner, messages, config=None):
+                if messages[-1].type == "tool":
+                    return AIMessage(content="parent finished")
+                return call("delegate_task", {
+                    "agent_name": "writer", "task": "write async.txt",
+                }, "delegate")
+
+        writer = sub.SubagentSpec(
+            "writer", "Write files", "Perform the requested write.",
+            (sandbox_tools.write_office_file,),
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("fluxagent.core.agent.MEMORY_DIR", directory), \
+             patch("fluxagent.core.agent.get_provider", return_value=Parent()), \
+             patch.object(sub, "get_provider", return_value=child), \
+             patch.object(sub, "audit_logger"), \
+             patch.object(sandbox_tools, "OFFICE_DIR", directory):
+            database = str(Path(directory) / "state.sqlite3")
+            async with AsyncSqliteSaver.from_conn_string(database) as memory:
+                with PermissionBroker(database) as broker:
+                    app = create_agent_app(
+                        tools=[sandbox_tools.write_office_file],
+                        checkpointer=memory,
+                        permission_broker=broker,
+                        subagent_specs=[writer],
+                        enable_subagents=True,
+                        enable_planner=False,
+                    )
+                    await app.ainvoke(
+                        {"messages": [HumanMessage(content="delegate write")]}, config=CONFIG
+                    )
+                    calls = await apending_approval(app, CONFIG)
+                    self.assertEqual(calls[0]["actor"], "subagent")
+                    action = broker.get(calls[0]["action_id"])
+                    approve_prepare(app, CONFIG, calls)
+                    result = await app.ainvoke(None, CONFIG)
+                    self.assertEqual(result["messages"][-1].content, "parent finished")
+                    self.assertEqual(
+                        (Path(directory) / "async.txt").read_text(encoding="utf-8"),
+                        "persisted",
+                    )
+                    child_checkpoint = await memory.aget_tuple({
+                        "configurable": {"thread_id": "subagent_" + action.child_run_id}
+                    })
+                    self.assertIsNone(child_checkpoint)
 
 
 class DynamicParentTests(unittest.TestCase):

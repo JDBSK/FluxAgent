@@ -78,7 +78,7 @@ def get_provider(
         )
         
     elif provider_name == "ollama":
-        from langchain_community.chat_models import ChatOllama
+        from langchain_ollama import ChatOllama
         
         final_base_url = base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         

@@ -1,6 +1,6 @@
 # FluxAgent-v2 功能补齐 + 测评体系 总结报告（最终版）
 
-日期：2026-09-12 ｜ 环境：conda `flux` ｜ 参照：`reference/CyberClaw`（prompt.md 测评框架）
+日期：2026-09-12 ｜ 环境：conda `flux` ｜ 项目演进：本人前置项目 `reference/CyberClaw` → `FluxAgent` → 当前 `FluxAgent-v2`
 
 ---
 
@@ -25,7 +25,7 @@
 
 | 层 | 内容 | 规模 | 结果 |
 |---|---|---|---|
-| L0 pytest 回归 | 存量 + 移植/新增 88 项（subagents 39 / runtime_guards 27 / 凭据 12 / 任务存储 8 / 打包 2） | **232 项** | 229 通过 3 跳过 0 失败 |
+| L0 pytest 回归 | 存量 + 移植/新增 88 项（subagents 39 / runtime_guards 27 / 凭据 12 / 任务存储 8 / 打包 2） | **232 项 → 393 项**（2026-09-18 复核） | 393 通过 3 跳过 0 失败 |
 | L1 确定性规则评测 | run_suite（沙盒/策略/预算/会话/MCP/HITL） | **610 例** | **100%，0 安全失败，0 回归** |
 | L2 真实模型 capability+contract+frontier | 151 用例定义（12 场景族），278 trials，n=278 | **278 trials** | **pass 267 / fail 8 / invalid 3（用例设计缺陷，已标注）/ 未决 0** |
 | L3 A/B 匿名换序 | 6 对 AB/BA | 12 次 SUT 运行 + 6 次 judge | 全部 tie、方向翻转 0（行为稳定可复现） |
@@ -77,6 +77,8 @@ python -m tests.eval.llmjudge.final_report                          :: 最终聚
 | `fluxagent.egg-info/`、`_wheel_dist/`、`logs/*.jsonl`（历史审计日志） | 构建产物/运行痕迹 |
 | `learning/`、`reference/`、`nvidia-apikey.txt` | 你自己的资料（**`nvidia-apikey.txt` 含 51 个密钥，注意保管**） |
 
+> 2026-09 更新：上表中的 `_` 前缀调试文件已迁入未跟踪的 `scratch/`（部分已删除）；`_wx_key.txt`、`_hub_key.txt`、`nvidia-apikey.txt` 等密钥文件已不在仓库中（此前核实均未入过 git）。
+
 另：开发中清理过项目内 `__pycache__`/`.pytest_cache`（可再生缓存，含项目改名前的陈旧字节码）。
 
 ## 五、面试差异化要点
@@ -101,3 +103,16 @@ python -m tests.eval.llmjudge.final_report                          :: 最终聚
 | tests/conftest.py 路由 LLM 环境隔离 | ✅ |
 
 详见 `CAPABILITY_ROUTING_EVALUATION.md` 第 7 节。无用文件待清理项已移交 `scratch/无用文件待清理.txt`。
+
+---
+
+## 七、入口规划判定轮（2026-09-18）增量
+
+| 项 | 状态 |
+|---|---|
+| 入口判定从“长度阈值规则”改为三层混合路由（规则快筛 → 小模型二元分类 → 保守兜底） | ✅ `fluxagent/core/plan_router.py`；`entry_route_source` 记录 rule/model/fallback/rule_abstain/resume |
+| 判定真缺陷修复：缺结果按失败、结构化 `ok` 状态、同参重试去重、`safe_calculate` 补 `❌` | ✅ `fluxagent/core/recovery.py`、`fluxagent/core/agent.py` |
+| 真实模型入口规划测评（50 条，含 13 条注入绕过） | ✅ 旧规则 **76%** → 新规则 **96%** → 混合 **100%（50/50）**；注入保持 7/7、非法结构 0、越权工具调用 0；50 条仅 12 次模型调用（76% 被规则挡掉） |
+| 复核口径 | ✅ L0 `pytest tests --ignore=tests/eval -q` = 393 passed / 3 skipped / 95 subtests；L1 `run_suite` = 610/610 零安全失败；全量 `pytest tests -q` = 1030 passed / 3 skipped / 95 subtests |
+
+报告：`artifacts/plan_router_eval_v1.json`；复现：`python -m tests.eval.plan_classifier_eval --model Deepseek-v4-flash`（`--dry-run` 只跑规则不联网）。细节见 `docs/学习笔记-新功能与测评.md` §31、§32。

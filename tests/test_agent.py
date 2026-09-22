@@ -11,6 +11,15 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 class TestAgent(unittest.TestCase):
 
+    def test_planner_prompt_preserves_parallel_investigation_as_one_step(self):
+        from fluxagent.core.agent import _build_planner_prompt
+
+        prompt = _build_planner_prompt("分别调查审批和恢复两条独立工作线，最后汇总")
+
+        self.assertIn("合并成同一个步骤", prompt)
+        self.assertIn("不要把它们拆成前后串行步骤", prompt)
+        self.assertIn("综合判断放在并行调查步骤之后", prompt)
+
     @patch('fluxagent.core.agent.get_provider')
     def test_simple_request_skips_planner_in_real_graph(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
@@ -481,6 +490,146 @@ class TestAgent(unittest.TestCase):
         except Exception as e:
             print(f"Unexpected error: {e}")
             raise
+
+
+    @patch('fluxagent.core.agent.get_provider')
+    def test_entry_route_uses_small_model_when_rules_abstain(self, mock_get_provider):
+        """规则说不准的请求（两个动作、没有先后词）才愿意花一次小模型调用。"""
+        from fluxagent.core.agent import create_agent_app
+        from tests.eval.stub import ScriptedLLM
+
+        classifier = ScriptedLLM(script=['{"needs_plan": true}'])
+        main = ScriptedLLM(
+            script=['["读取文件内容", "写入摘要"]', "读取完成", "摘要写好了"]
+        )
+
+        def provider_for(provider_name=None, model_name=None, **kwargs):
+            return classifier if model_name == "classifier-model" else main
+
+        mock_get_provider.side_effect = provider_for
+        with patch.dict(
+            os.environ,
+            {
+                "DEFAULT_MODEL": "classifier-model",
+                "DEFAULT_PROVIDER": "stub",
+                "FLUXAGENT_PLAN_CLASSIFIER": "1",
+            },
+        ):
+            app = create_agent_app(tools=[], require_approval=False, enable_planner=True)
+            result = app.invoke(
+                {"messages": [HumanMessage(content="读取文件内容，写入摘要")]}
+            )
+
+        self.assertEqual(result["entry_route_source"], "model")
+        self.assertTrue(result["entry_needs_plan"])
+        self.assertEqual(result["planning_request"], "读取文件内容，写入摘要")
+        self.assertEqual(len(result["task_plan"]), 2)
+        self.assertEqual(result["task_status"], "done")
+        self.assertEqual(classifier.cursor, 1)
+
+    @patch('fluxagent.core.agent.get_provider')
+    def test_entry_route_falls_back_conservatively_when_classifier_is_broken(
+        self, mock_get_provider
+    ):
+        """分类器不吐合法布尔就保守回退成"不规划"，不能把请求卡死在入口。"""
+        from fluxagent.core.agent import create_agent_app
+        from tests.eval.stub import ScriptedLLM
+
+        classifier = ScriptedLLM(script=["我觉得需要规划吧"])
+        main = ScriptedLLM(script=["直接回答"])
+
+        def provider_for(provider_name=None, model_name=None, **kwargs):
+            return classifier if model_name == "classifier-model" else main
+
+        mock_get_provider.side_effect = provider_for
+        with patch.dict(
+            os.environ,
+            {
+                "DEFAULT_MODEL": "classifier-model",
+                "DEFAULT_PROVIDER": "stub",
+                "FLUXAGENT_PLAN_CLASSIFIER": "1",
+            },
+        ):
+            app = create_agent_app(tools=[], require_approval=False, enable_planner=True)
+            result = app.invoke(
+                {"messages": [HumanMessage(content="读取文件内容，写入摘要")]}
+            )
+
+        self.assertEqual(result["entry_route_source"], "fallback")
+        self.assertFalse(result["entry_needs_plan"])
+        self.assertEqual(result["task_plan"], [])
+        self.assertEqual(result["task_status"], "done")
+
+    @patch('fluxagent.core.agent.get_provider')
+    def test_rule_fast_path_never_spends_a_classifier_call(self, mock_get_provider):
+        from fluxagent.core.agent import create_agent_app
+        from tests.eval.stub import ScriptedLLM
+
+        classifier = ScriptedLLM(script=['{"needs_plan": true}'])
+        main = ScriptedLLM(
+            script=['["检查当前配置", "给出最终结论"]', "配置检查完成", "最终结论"]
+        )
+
+        def provider_for(provider_name=None, model_name=None, **kwargs):
+            return classifier if model_name == "classifier-model" else main
+
+        mock_get_provider.side_effect = provider_for
+        with patch.dict(
+            os.environ,
+            {
+                "DEFAULT_MODEL": "classifier-model",
+                "DEFAULT_PROVIDER": "stub",
+                "FLUXAGENT_PLAN_CLASSIFIER": "1",
+            },
+        ):
+            app = create_agent_app(tools=[], require_approval=False, enable_planner=True)
+            result = app.invoke(
+                {"messages": [HumanMessage(content="请先检查当前配置，然后给出最终结论")]}
+            )
+
+        self.assertEqual(result["entry_route_source"], "rule")
+        self.assertEqual(classifier.cursor, 0)
+        self.assertEqual(result["task_status"], "done")
+
+    @patch('fluxagent.core.agent.get_provider')
+    def test_identical_failing_tool_call_is_not_retried_forever(self, mock_get_provider):
+        """同一个工具 + 完全相同的参数失败两次后，重试不再产生新信息。"""
+        import fluxagent.core.agent as agent_mod
+        from fluxagent.core.agent import create_agent_app
+        from fluxagent.core.budget import RunBudget
+        from tests.eval.stub import ScriptedLLM, make_tool
+
+        def reply(messages):
+            prompt = " ".join(str(getattr(m, "content", "")) for m in messages)
+            if "replan module" in prompt:
+                return '["换一种方式备份数据", "确认备份结果"]'
+            if "智能规划器" in prompt:
+                return '["备份数据"]'
+            return [{"name": "备份数据", "args": {"value": "same"}}]
+
+        mock_get_provider.return_value = ScriptedLLM(script=[reply] * 12)
+        with patch.object(agent_mod.audit_logger, "log_event") as log_event:
+            app = create_agent_app(
+                tools=[make_tool("备份数据", fail=True)],
+                require_approval=False,
+                enable_planner=True,
+                budget=RunBudget(max_retries_per_step=5, max_replans=2),
+            )
+            result = app.invoke(
+                {
+                    "messages": [
+                        HumanMessage(content="先备份数据然后清理日志最后生成报告")
+                    ]
+                }
+            )
+
+        actions = [call.kwargs.get("action") for call in log_event.call_args_list]
+        self.assertIn("retry_suppressed_duplicate", actions)
+        self.assertEqual(result["task_status"], "failed")
+        self.assertEqual(result["last_failure_class"], "exhausted")
+        self.assertGreaterEqual(
+            max(result["attempted_tool_calls"].values()), 3
+        )
 
 
 if __name__ == '__main__':

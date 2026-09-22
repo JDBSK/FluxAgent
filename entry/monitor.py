@@ -26,7 +26,7 @@ cyber_theme = Theme({
     "ai_message": "bold bright_magenta",
     "graph_transition": "bold bright_cyan",
     "timestamp": "dim white"
-})
+})  # 解析每行事件，按照类型进行渲染
 
 console = Console(theme=cyber_theme)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -66,8 +66,8 @@ def print_header():
     console.print()
 
 def resolve_log_file(session_ref: str | None = None) -> str:
-    """Resolve an explicit or currently active session to its JSONL log."""
-    store = SessionStore()
+    """解决显式或当前活动会话的 JSONL 日志路径。找到会话记录后，返回其日志文件路径；找不到会话则抛出 SessionError。"""
+    store = SessionStore()  # 初始化会话存储
     active = store.bootstrap()
     record = store.resolve(session_ref, include_archived=True) if session_ref else active
     safe_id = "".join(c for c in record.id if c.isalnum() or c in "-_") or "default"
@@ -75,7 +75,7 @@ def resolve_log_file(session_ref: str | None = None) -> str:
 
 
 def tail_f(path_provider):
-    """Follow a log file and reopen it when the active session changes."""
+    """尾随一个日志文件,并在活动会话更改时重新打开它。类似tail -f从日志尾只读取新产生的JSON事件,但支持动态切换文件。"""
     current_path = ""
     stream = None
     waiting_for = ""
@@ -107,6 +107,95 @@ def tail_f(path_provider):
         if stream is not None:
             stream.close()
 
+def _short_id(value) -> str:
+    value = str(value or "-")
+    return value[:8] if value != "-" else value
+
+
+def _display_text(value, limit=420) -> str:
+    text = str(value or "-").replace("\n", " ")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _subagent_identity(data: dict) -> str:
+    parts = [f"角色={data.get('agent_name', '?')}", f"run={_short_id(data.get('run_id'))}"]
+    parent = _short_id(data.get("parent_run_id"))
+    if parent != "-":
+        parts.append(f"parent={parent}")
+    return "  ".join(parts)
+
+
+def _subagent_line(ts: str, data: dict, message: str, style="bright_cyan"):
+    line = Text()
+    line.append(f"[ {ts} ] ", style="dim white")
+    line.append("子 Agent ", style="bold bright_cyan")
+    line.append(_subagent_identity(data) + "  ", style="cyan")
+    line.append(message, style=style)
+    console.print(line)
+
+
+def _render_subagent_event(ts: str, data: dict):
+    """提交给子 Agent 的事件统一走独立的 Rich 视觉分支，避免与主 Agent 混淆。"""
+    event = data.get("event")
+    action = str(data.get("action") or "")
+    if event == "system_action" and action == "subagent_started":
+        body = Text()
+        body.append(f"[ {ts} ] ", style="dim white")
+        body.append(_subagent_identity(data) + "\n", style="cyan")
+        body.append("任务  ", style="bold white")
+        body.append(_display_text(data.get("task"), 700) + "\n", style="white")
+        body.append("工具  ", style="bold white")
+        body.append(", ".join(data.get("tools") or []) or "无（纯分析）", style="white")
+        console.print(Panel(
+            body,
+            title="✦ 子 Agent 已启动 · 主 Agent → 子 Agent",
+            title_align="left",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=False,
+        ))
+        return
+
+    if event == "system_action" and action == "subagent_completed":
+        result = _display_text(data.get("result_summary"), 900)
+        suffix = f"  · {data.get('duration_ms')}ms" if data.get("duration_ms") is not None else ""
+        body = Text(_subagent_identity(data) + "\n", style="cyan")
+        body.append(result + "\n", style="bright_white")
+        body.append("已返回主 Agent" + suffix, style="dim cyan")
+        console.print(Panel(
+            body,
+            title="✓ 子 Agent 完成",
+            title_align="left",
+            border_style="green",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=False,
+        ))
+        return
+
+    if event == "system_action" and action.startswith("subagent_"):
+        suffix = f"  · {data.get('duration_ms')}ms" if data.get("duration_ms") is not None else ""
+        _subagent_line(ts, data, _display_text(data.get("content") or action) + suffix, "yellow")
+        return
+
+    if event == "llm_input":
+        return
+
+    if event == "tool_call":
+        args = json.dumps(data.get("args", {}), ensure_ascii=False, separators=(",", ":"))
+        _subagent_line(ts, data, f"调用工具 {data.get('tool', 'unknown')}  参数={_display_text(args, 260)}", "yellow")
+        return
+
+    if event == "tool_result":
+        _subagent_line(ts, data, f"工具结果 {data.get('tool', 'unknown')}  {_display_text(data.get('result_summary'), 320)}", "green")
+        return
+
+    if event == "ai_message":
+        _subagent_line(ts, data, f"阶段输出  {_display_text(data.get('content'), 420)}", "magenta")
+        return
+
+
 def render_event(line: str):
     """解析并渲染监控日志 (100% 中文还原)"""
     try:
@@ -121,7 +210,12 @@ def render_event(line: str):
             ts = ts_str.split("T")[-1][:8]
             
         prefix = f"[timestamp][ {ts} ][/timestamp] "
-        
+
+        # 子 Agent 事件统一走独立的 Rich 视觉分支，避免与主 Agent 混淆。
+        if data.get("run_id") and data.get("agent_name"):
+            _render_subagent_event(ts, data)
+            return
+
         if event == "llm_input":
             # 解析 LLM 输入事件，显示上下文记忆条数
             count = data.get("message_count", 0)
@@ -144,34 +238,7 @@ def render_event(line: str):
             
         elif event == "system_action":
             action = data.get("action", "")
-            if str(action).startswith("subagent_"):
-                # 子任务生命周期：谁在做（角色/来源）、父子任务 ID、终态。
-                # 用 Text 字面渲染，内容不做 markup 解释，避免日志注入样式。
-                duration = data.get("duration_ms")
-                line = Text(
-                    f"{prefix}✦ 子任务[{action}]"
-                    f" 角色={data.get('agent_name', '?')}"
-                    f"({data.get('role_source', '?')})"
-                    f" run={str(data.get('run_id', '-'))[:8]}"
-                    f" parent={str(data.get('parent_run_id', '-'))[:8]}"
-                    + (f" 耗时={duration}ms" if duration is not None else "")
-                    + (f" 工具={data.get('tools')}" if data.get("tools") else "")
-                    + (f"\n  {data.get('content', '')}" if data.get("content") else ""),
-                    style="warning",
-                )
-                console.print(line)
-            else:
-                console.print(f"{prefix}[warning]✦ 底层状态机：{action}[/warning]")
-
-        elif event == "graph_transition":
-            source = data.get("from_node", "?")
-            target = data.get("to_node", "?")
-            status = data.get("task_status") or "-"
-            step = data.get("step_index", 0)
-            console.print(
-                f"{prefix}[graph_transition]↪ 图转移：{source} -> {target}"
-                f"  [状态={status} 步骤={step}][/graph_transition]"
-            )
+            console.print(f"{prefix}[warning]✦ 底层状态机：{action}[/warning]")
 
         elif event == "ai_message":
             content = str(data.get("content", ""))

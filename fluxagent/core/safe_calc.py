@@ -64,9 +64,13 @@ def _eval_node(node: Any) -> Any:
 
 
 def _err(msg: str) -> str:
-    """构造错误信息，同时包含中文（单测用）和英文 error 标记（评测用）。"""
+    """构造错误信息，同时包含中文（单测用）和英文 error 标记（评测用）。
+
+    前缀 ``❌`` 是项目的工具失败约定，recovery 的失败判定直接读它；
+    少了这个标记，工具失败会被当成正常结果（任务状态照推、熔断不计数）。
+    """
     # Keep Chinese for unit tests and English "error" token for eval runners.
-    return f"计算出错: error: {msg}"
+    return f"❌ 计算出错: error: {msg}"
 
 
 def safe_calculate(expression: str) -> str:

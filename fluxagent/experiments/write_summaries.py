@@ -166,20 +166,24 @@ run_overnight.cmd   :: 回归 -> 能力测试 -> 定向测评（含规模扫描�
 
 UNUSED_FILES_TXT = """# 疑似无用文件清单（仅记录，未删除任何文件）
 
-以下文件在本次实现期间判定为疑似无用/临时产物，按硬约束未执行删除，由仓库所有者自行决定：
+以下文件在实现期间判定为疑似无用/临时产物，按硬约束未执行删除；2026-09 仓库整理后的状态如下，由仓库所有者自行决断：
 
-## 评测调试与临时输出（项目根目录）
+## 评测调试与临时输出（已移入未跟踪的 scratch/）
 - _full_eval_log.txt            旧全量评测日志
 - _retest_b.txt / _retest_h01.txt 旧复测日志
 - _run_full_eval.cmd            旧一次性评测脚本（已被 run_overnight.cmd 取代）
-- _tmp_check.cmd / _tmp_diag.cmd 本次开发期间创建的环境检查临时脚本
+- _real_corpus_check.py         真实语料冒烟脚本（run_overnight.cmd 第 4 阶段经 scratch/ 调用）
+- _tmp_*.py / _tmp_diag2.cmd    开发期临时探针
+
+## 已不存在
+- _tmp_check.cmd / _tmp_diag.cmd 等早期临时脚本
+- _wx_key.txt / _hub_key.txt / nvidia-apikey.txt 等密钥文件（已处置，此前核实均未入过 git）
 
 ## 历史备份（tests/eval，git 已跟踪删除）
 - tests/eval/cases.py.bak、runtime_cases.py.bak、_runtime_cases_snip.py、hdr.txt（已在基线提交中删除）
 
 ## 说明
-- logs/、workspace/、*.sqlite3、reference/、.zcode/ 均为运行态/本地数据，已在 .gitignore 排除，不属于本清单处理范围。
-- nvidia-apikey.txt、_wx_key.txt、_hub_key.txt 等疑似密钥文件如仍存在，建议所有者自行妥善处置（本次实现未读取项目外路径，也未将其内容写入任何提交）。
+- logs/、workspace/、*.sqlite3、reference/、.zcode/、scratch/ 均为运行态/本地数据，已在 .gitignore 排除，不属于本清单处理范围。
 """
 
 

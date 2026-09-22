@@ -12,6 +12,7 @@ async_main 把各模块拼起来：
 """
 
 import os
+import sys
 import time
 import asyncio
 import random
@@ -35,17 +36,80 @@ from fluxagent.core.config import DB_PATH
 from fluxagent.core.bus import task_queue, stop_workers
 from fluxagent.core.heartbeat import pacemaker_loop
 from fluxagent.core.context import render_plan
-from fluxagent.core.permissions import PermissionManager
+from fluxagent.core.permission_broker import PermissionBroker
 from fluxagent.core.policy import build_policy_config
 from fluxagent.core.session import SessionStore
+from fluxagent.core.logger import audit_logger
 from fluxagent.core.skill_loader import load_dynamic_skills
 from fluxagent.core.tools.builtins import BUILTIN_TOOLS
 from fluxagent.mcp.client import load_installed_mcp_tools
 from entry.session_cmd import handle_slash_command, sync_config_to_active
 
+_RESUME_SENTINEL = object()
+_RESUMABLE_STATUSES = {"running", "waiting_approval", "replanning"}
+
+
+def resumable_checkpoint(snapshot) -> dict | None:
+    """Return a small description when a thread has an unfinished graph run."""
+    values = dict(getattr(snapshot, "values", None) or {})
+    next_nodes = tuple(getattr(snapshot, "next", None) or ())
+    status = str(values.get("task_status") or "")
+    pending_actions = list(values.get("pending_action_ids") or [])
+    subagent_runs = values.get("subagent_runs") or {}
+    active_subagents = [
+        run for run in subagent_runs.values()
+        if str(run.get("status") or "") in {"running", "approval_required"}
+    ] if isinstance(subagent_runs, dict) else []
+    if not next_nodes and not pending_actions and not active_subagents:
+        return None
+    if status not in _RESUMABLE_STATUSES and not pending_actions and not active_subagents:
+        return None
+    return {
+        "status": status or "unknown",
+        "next": next_nodes,
+        "pending_actions": len(pending_actions),
+        "active_subagents": len(active_subagents),
+    }
+
+
+async def detect_resumable_checkpoint(app, config: dict) -> dict | None:
+    """Read the active thread without advancing the graph."""
+    snapshot = await app.aget_state(config)
+    return resumable_checkpoint(snapshot)
+
+
+def _log_task_crash(task_name: str, t):
+    """后台任务静默死亡时把异常写进审计日志——否则 asyncio 会吞掉异常且无任何输出。"""
+    import traceback
+    if t.cancelled():
+        return
+    exc = t.exception()
+    if exc is None:
+        return
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1200:]
+    audit_logger.log_event(
+        thread_id="system_default",
+        event="system_action",
+        action="background_task_crashed",
+        task=task_name,
+        error=detail,
+    )
+
 def clear_screen():
     """清空当前终端屏幕。"""
     os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def _configure_console_streams() -> None:
+    """Keep Windows CMD usable when its code page cannot encode UI symbols."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
 
 def type_line(text: str, delay: float = 0.008):
     """按字符延迟输出一行文本。"""
@@ -147,7 +211,10 @@ async def async_main():
     current_model = os.getenv("DEFAULT_MODEL", "glm-5")
 
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as memory:
-        permission_manager = PermissionManager()
+        # 异步上下文管理器，确保在退出时自动关闭数据库连接，保存数据并释放资源。
+        # 点击ctrl+c或ctrl+d退出时，async with 块会触发 __aexit__ 方法，确保数据库连接被正确关闭。
+        permission_broker = PermissionBroker(DB_PATH)
+        permission_broker.purge_terminal(older_than_seconds=86400)
         mcp_result = await load_installed_mcp_tools()
 
         # ---------- 统一能力注册表：builtin + skill + mcp 全部走同一协议 ----------
@@ -185,7 +252,7 @@ async def async_main():
                 [info],
                 content_loader=read_skill_manual,
                 tool_loader=lambda item: skill_tools_by_name.get(str(item.get("name") or "")),
-            )
+            )  # 生成能力描述器，提供给模型进行能力调用
             for descriptor in descriptors:
                 _register(descriptor)
 
@@ -197,10 +264,13 @@ async def async_main():
             provider_name=current_provider,
             model_name=current_model,
             checkpointer=memory,
-            permission_manager=permission_manager,
-            capability_registry=capability_registry,
+            permission_broker=permission_broker,
+            capability_registry=capability_registry,  # 统一能力注册表
             policy=policy,
-        )
+        )  # 创建 Agent 应用,用于处理用户输入、调用工具和管理会话状态
+        if getattr(app, "subagent_runner", None) is not None:
+            await app.subagent_runner.cleanup_terminal_checkpoints()
+
         session_store = SessionStore()
         config = {"configurable": {"thread_id": "local_geek_master"}}
         active_id = sync_config_to_active(session_store, config)
@@ -216,6 +286,40 @@ async def async_main():
         for error in mcp_result.errors:
             cprint("  \033[38;5;208m* MCP 连接失败: %s\033[0m" % error)
         cprint()
+
+        resume_info = await detect_resumable_checkpoint(app, config)
+        resume_requested = False
+        if resume_info is not None:
+            cprint(
+                "  \033[38;5;208m⚠ 检测到上次任务未完成："
+                f"status={resume_info['status']}"
+                f" next={','.join(resume_info['next']) or '-'}"
+                f" pending={resume_info['pending_actions']}"
+                f" subagents={resume_info['active_subagents']}\033[0m"
+            )
+            resume_prompt = PromptSession()
+            while True:
+                answer = (await resume_prompt.prompt_async(
+                    ANSI("  \033[38;5;208m继续上次任务? (y/n)\033[0m ")
+                )).strip().lower()
+                if answer in {"y", "yes", "是", "n", "no", "否"}:
+                    resume_requested = answer in {"y", "yes", "是"}
+                    break
+                cprint("  \033[38;5;208m请输入 y 或 n。\033[0m")
+            if resume_requested:
+                cprint("  \033[38;5;108m● 将从原 checkpoint 继续，不重新委派\033[0m")
+            else:
+                previous_id = config["configurable"]["thread_id"]
+                fresh = session_store.create(
+                    title="新任务（未恢复旧任务）",
+                    make_active=True,
+                    origin="system",
+                )
+                config["configurable"]["thread_id"] = fresh.id
+                cprint(
+                    "  \033[38;5;245m● 已切换到新会话；旧任务保留在 "
+                    f"{previous_id}，不会混入新输入\033[0m"
+                )
 
         class SpinnerState:
             """保存底部状态栏动画的运行状态。"""
@@ -274,10 +378,8 @@ async def async_main():
             # 这个协程负责从消息总线 task_queue 取出用户输入或心跳触发的任务，调用 app.astream() 执行图，并处理审批闸门
             while True:
                 user_input = await task_queue.get()
-                if user_input is stop_worker:
-                    task_queue.task_done()
-                    break
-                raw_in = (user_input or "").strip()
+                resume_only = user_input is _RESUME_SENTINEL
+                raw_in = "" if resume_only else (user_input or "").strip()
                 if raw_in.lower() in ["/exit", "/quit"]:
                     task_queue.task_done()
                     break
@@ -285,7 +387,7 @@ async def async_main():
                 # Session slash commands stay outside the agent graph.
                 if raw_in.startswith("/"):
                     handled, msg = await handle_slash_command(
-                        raw_in, session_store, app, config, permission_manager
+                        raw_in, session_store, app, config
                     )
                     if handled:
                         spinner.is_spinning = False
@@ -306,7 +408,7 @@ async def async_main():
                 spinner.is_spinning = True
                 spinner.is_tool_calling = False
                 
-                inputs = {"messages": [HumanMessage(content=user_input)]}
+                inputs = None if resume_only else {"messages": [HumanMessage(content=user_input)]}
                 try:
                     # 一次用户输入可能被审批闸门打断多次（多个副作用工具），进入LangGraph状态图
                     # 所以外层循环：跑到中断 -> 等审批 -> 续跑 -> 直到没有待批
@@ -416,33 +518,23 @@ async def async_main():
                         for line in describe_calls(calls).split("\n"):
                             cprint(f"    \033[38;5;208m{line}\033[0m")
                         cprint(
-                            "  \033[38;5;250m输入 y 单次 / s 本次记住相同调用 / "
-                            "a 永久记住相同调用 / n 拒绝\033[0m"
+                            "  \033[38;5;250m输入 y 单次批准 / n 拒绝\033[0m"
                         )
 
                         valid_answers = {
-                            "y", "yes", "是", "s", "session", "本次", "记住",
-                            "a", "always", "永久", "总是", "n", "no", "否",
+                            "y", "yes", "是", "n", "no", "否",
                         }
                         while True:
                             answer = (await approval_session.prompt_async(
-                                ANSI("  \033[38;5;208m批准? (y/s/a/n)\033[0m ")
+                                ANSI("  \033[38;5;208m批准? (y/n)\033[0m ")
                             )).strip().lower()
                             if answer in valid_answers:
                                 break
-                            cprint("  \033[38;5;208m请输入 y、s、a 或 n。\033[0m")
+                            cprint("  \033[38;5;208m请输入 y 或 n。\033[0m")
 
                         spinner.start_time = time.time()
                         spinner.is_spinning = True
-                        if answer in ("s", "session", "本次", "记住"):
-                            permission_manager.grant_calls(calls, persistent=False)
-                            cprint("  \033[38;5;108m● 已批准，本次运行记住相同工具和参数\033[0m")
-                            approve_prepare(app, config, calls)
-                        elif answer in ("a", "always", "永久", "总是"):
-                            permission_manager.grant_calls(calls, persistent=True)
-                            cprint("  \033[38;5;108m● 已批准，永久记住相同工具和参数\033[0m")
-                            approve_prepare(app, config, calls)
-                        elif answer in ("y", "yes", "是"):
+                        if answer in ("y", "yes", "是"):
                             cprint("  \033[38;5;108m● 已批准\033[0m")
                             approve_prepare(app, config, calls)
                         elif answer in ("n", "no", "否"):
@@ -458,17 +550,18 @@ async def async_main():
                     cprint(f"  \033[31m[ ⚠️ 引擎异常 : {e} ]\033[0m")
 
                 spinner.is_spinning = False
-                try:
-                    sid = config.get("configurable", {}).get("thread_id")
-                    if sid:
-                        session_store.touch(
-                            sid,
-                            preview=raw_in[:100],
-                            message_delta=1,
-                            auto_title_from=raw_in,
-                        )
-                except Exception:
-                    pass
+                if not resume_only:
+                    try:
+                        sid = config.get("configurable", {}).get("thread_id")
+                        if sid:
+                            session_store.touch(
+                                sid,
+                                preview=raw_in[:100],
+                                message_delta=1,
+                                auto_title_from=raw_in,
+                            )
+                    except Exception:
+                        pass
                 cprint() # 空出舒适的行距
                 task_queue.task_done()
 
@@ -504,6 +597,13 @@ async def async_main():
                     user_input = user_input.strip()
                     if not user_input:
                         continue
+
+                    audit_logger.log_event(
+                        thread_id="system_default",
+                        event="system_action",
+                        action="cli_input_received",
+                        preview=user_input[:60],
+                    )
                     
 
                     padded_bubble = f"  ❯ {user_input}    "
@@ -527,6 +627,11 @@ async def async_main():
             # 启动异步任务
             worker = asyncio.create_task(agent_worker())
             heartbeat_worker = asyncio.create_task(pacemaker_loop(task_queue=task_queue, check_interval=10))
+            worker.add_done_callback(lambda t, n="agent_worker": _log_task_crash(n, t))
+            heartbeat_worker.add_done_callback(lambda t, n="pacemaker_loop": _log_task_crash(n, t))
+            if resume_requested:
+                await task_queue.put(_RESUME_SENTINEL)
+                await task_queue.join()
             await user_input_loop()
             # 退出排空：先停心跳生产者（取消后可能补投最后一个任务），
             # 再发退出哨兵并 join，保证已入队工作全部处理完，消费者才退出。
@@ -534,6 +639,7 @@ async def async_main():
 
 def main():
     """启动异步终端应用。"""
+    _configure_console_streams()
     asyncio.run(async_main())
 
 if __name__ == "__main__":

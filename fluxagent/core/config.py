@@ -39,7 +39,6 @@ OFFICE_DIR = os.path.join(WORKSPACE_DIR, "office")         # 沙盒工位 唯一
 SKILLS_DIR = os.path.join(OFFICE_DIR, "skills")            # 技能卡槽
 MCP_SERVERS_DIR = os.path.join(WORKSPACE_DIR, "mcp_servers")
 MCP_SERVERS_INDEX = os.path.join(MCP_SERVERS_DIR, "index.json")
-PERMISSIONS_FILE = os.path.join(WORKSPACE_DIR, "permissions.json")
 TASKS_FILE = os.path.join(WORKSPACE_DIR, "tasks.json")
 SESSIONS_DIR = os.path.join(WORKSPACE_DIR, "sessions")     # 多会话元数据与会话笔记
 SESSIONS_INDEX = os.path.join(SESSIONS_DIR, "index.json")  # 会话索引（与 checkpoint 分离）

@@ -33,6 +33,20 @@ class TestPolicyHardening(unittest.TestCase):
         self.assertTrue(decision.hard_deny)
         self.assertFalse(decision.needs_approval)
 
+    def test_empty_overwrite_cannot_bypass_delete_denial(self):
+        assessment = assess_call(
+            "write_office_file",
+            {"filepath": "protected.txt", "content": "", "mode": "w"},
+        )
+        self.assertTrue(assessment.hard_deny)
+        self.assertIn("write_empty_overwrite", assessment.reasons)
+
+        append = assess_call(
+            "write_office_file",
+            {"filepath": "audit.log", "content": "", "mode": "a"},
+        )
+        self.assertFalse(append.hard_deny)
+
     def test_installer_source_and_subdirectory_signals(self):
         safe = assess_call(
             "install_mcp_server",

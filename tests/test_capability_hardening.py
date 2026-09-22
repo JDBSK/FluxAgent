@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 from langchain_core.messages import AIMessage, HumanMessage
 
 from fluxagent.capability.context_compiler import CompilationContext, ContextCompiler, MemoryScope, MemoryStore
-from fluxagent.capability.retrieval import DenseIndex, DeterministicEmbedding
+from fluxagent.capability.retrieval import DenseIndex, DeterministicEmbedding, OpenAICompatibleEmbedding
 from fluxagent.capability.registry import CapabilityRegistry
 from fluxagent.capability.router import (
     Candidate,
@@ -287,6 +287,27 @@ class TestDenseIndexRoundtrip(unittest.TestCase):
                 index.search("股票 行情", provider, top_k=2),
                 loaded.search("股票 行情", provider, top_k=2),
             )
+
+
+class TestOpenAIEmbeddingBatching(unittest.TestCase):
+    @patch("openai.OpenAI")
+    def test_requests_are_split_at_service_batch_limit(self, openai_cls):
+        client = openai_cls.return_value
+
+        def make_response(batch):
+            return type("Response", (), {
+                "data": [type("Item", (), {"embedding": [float(i)]}) for i, _ in enumerate(batch)]
+            })()
+
+        client.embeddings.create.side_effect = lambda **kwargs: make_response(kwargs["input"])
+        provider = OpenAICompatibleEmbedding("https://example.test/v1", "key", "embed")
+        vectors = provider.embed_texts([f"text-{i}" for i in range(21)])
+
+        self.assertEqual(client.embeddings.create.call_count, 2)
+        calls = client.embeddings.create.call_args_list
+        self.assertEqual(len(calls[0].kwargs["input"]), 20)
+        self.assertEqual(len(calls[1].kwargs["input"]), 1)
+        self.assertEqual(len(vectors), 21)
 
 
 

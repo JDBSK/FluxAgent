@@ -119,6 +119,15 @@ class AgentState(TypedDict, total=False):
     context_chars_after_trim: int
     summary_llm_calls: int
     last_run_summary: dict
+    entry_needs_plan: bool
+    entry_route_source: str
+    planning_request: str
+    successful_tool_calls: dict
+    processed_tool_call_ids: list[str]
+    attempted_tool_calls: dict
+    subagent_runs: dict
+    subagent_results: dict
+    pending_action_ids: list[str]
 
 
 def make_plan_step(step_id: int, action: str, status: str = STEP_PENDING, note: str = "") -> dict[str, Any]:

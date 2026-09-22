@@ -368,6 +368,10 @@ def assess_call(
             reasons.extend(path_reasons)
             level = RiskLevel.CRITICAL
         content = str(args.get("content", ""))
+        mode = str(args.get("mode", "w") or "w").strip().casefold()
+        if "content" in args and mode in {"w", "write", "overwrite"} and not content:
+            reasons.append("write_empty_overwrite")
+            level = RiskLevel.CRITICAL
         if len(content) >= 8000:
             reasons.append("write_large_payload")
             level = max(level, RiskLevel.MUTATE)

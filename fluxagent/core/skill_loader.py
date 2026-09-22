@@ -186,6 +186,7 @@ class LazySkillLoader:
     def _scan_skills(self, force_rescan: bool = False) -> List[Dict[str, Any]]:
         current_time = time.monotonic()
         with self._lock:
+            # TTL 60 秒，避免频繁扫描磁盘；首次调用或强制重扫时才重新扫描。
             if (not force_rescan and self._skill_registry is not None
                     and current_time - self._last_scan_time < self._scan_interval):
                 return self._skill_registry
@@ -204,6 +205,7 @@ class LazySkillLoader:
             if not os.path.isdir(folder_path):
                 continue
 
+            # 扫描skills/*/SKILL.md
             md_path = os.path.join(folder_path, "SKILL.md")
             if not os.path.exists(md_path):
                 md_path = os.path.join(folder_path, "README.md")
@@ -248,6 +250,7 @@ class LazySkillLoader:
             with open(md_path, "r", encoding="utf-8") as f:
                 lines = []
                 for i, line in enumerate(f):
+                    # 扫描时只扫描前120行，只用于发现和检索，不是执行授权
                     if i >= 120:
                         break
                     lines.append(line)

@@ -179,6 +179,8 @@ class DeterministicEmbedding(EmbeddingProvider):
 class OpenAICompatibleEmbedding(EmbeddingProvider):
     """OpenAI 兼容 embedding 适配器；base_url/key/model 全部由调用方注入。"""
 
+    MAX_BATCH_SIZE = 20
+
     def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 30.0) -> None:
         if not base_url or not model:
             raise EmbeddingError("embedding base_url/model 必须配置")
@@ -196,13 +198,16 @@ class OpenAICompatibleEmbedding(EmbeddingProvider):
         client = OpenAI(
             api_key=self._api_key, base_url=self.base_url, timeout=self.timeout
         )
-        try:
-            response = client.embeddings.create(
-                model=self.model, input=list(texts)
-            )
-        except Exception as exc:  # noqa: BLE001 - 上层据 EmbeddingError abstain
-            raise EmbeddingError(f"embedding 调用失败: {exc}") from exc
-        return [item.embedding for item in response.data]
+        inputs = list(texts)
+        vectors: List[List[float]] = []
+        for start in range(0, len(inputs), self.MAX_BATCH_SIZE):
+            batch = inputs[start : start + self.MAX_BATCH_SIZE]
+            try:
+                response = client.embeddings.create(model=self.model, input=batch)
+            except Exception as exc:  # noqa: BLE001 - 上层据 EmbeddingError abstain
+                raise EmbeddingError(f"embedding 调用失败: {exc}") from exc
+            vectors.extend(item.embedding for item in response.data)
+        return vectors
 
 
 class DenseIndex:

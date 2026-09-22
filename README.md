@@ -130,8 +130,6 @@ CLI 会话控制命令：
 | /rename <id \| 标题>  | 重命名当前会话 |
 | /pin                  | 置顶当前会话   |
 | /archive <id \| 标题> | 归档会话       |
-| /permissions          | 查看精确授权   |
-| /permissions reset    | 清楚授权       |
 | /exit                 | 退出程序       |
 
 #### **⏰ 心跳任务系统**
@@ -229,11 +227,12 @@ LLM Tool Call
     ↓
 Policy：READ / WRITE / MUTATE / EXEC / CRITICAL
     ├── READ：直接执行
-    ├── WRITE / MUTATE / EXEC：进入 approval，等待 y / s / a / n
+    ├── WRITE / MUTATE / EXEC：进入 approval，等待一次性 y / n
     └── CRITICAL：直接阻断，不进入审批
 ```
 
-审批授权绑定“工具名 + 规范化参数的 SHA-256”。同一个工具只要参数发生变化，就需要重新确认；`critical` 调用即使曾经授权也不会绕过硬拒绝。
+审批由 SQLite `PermissionBroker` 管理。每个副作用调用生成一次性 `action_id`，状态按
+`pending → approved/rejected → executing → succeeded/failed/unknown` 推进。SQLite 条件更新保证同一动作只能进入一次 `executing`；参数变化会生成新动作并重新审批。所有审批权限统一由 `PermissionBroker` 管理。
 
 用户拒绝时，系统会补齐与原调用相同 `tool_call_id` 的 `ToolMessage`，保持模型消息协议完整，避免下一轮请求因为缺少工具结果而失败。
 
@@ -251,7 +250,20 @@ Policy：READ / WRITE / MUTATE / EXEC / CRITICAL
 - 默认高/低水位为 20/10：达到 20 个用户回合后压缩旧内容，保留最近 10 个完整回合。
 - 旧回合摘要保存于 checkpoint，全局用户画像保存为 Markdown，会话笔记按会话隔离。
 
-### **5. Skill 两阶段懒加载**
+### **5. 可恢复主从 Agent**
+
+- 主 Agent 可通过 `delegate_task` 将独立复杂任务交给子 Agent；同一轮只批量委派互不依赖的平级任务，默认同时运行 2 个，其余进入最多 8 个任务的有界等待队列。
+- 主图在当前用户任务内保存已完成子任务账本；重规划再次发出完全相同的委派参数时直接复用结果，只执行未完成项。
+- 子 Agent 使用独立 `thread_id/run_id` 和短期 SQLite 检查点，不继承用户画像、完整主对话或主图摘要。
+- 只读工具直接执行；副作用调用暂停子图并在主会话显示审批。批准后恢复原子图、原工具和原参数，不由主 Agent 重新调用。
+- 子 Agent 不能递归委派，工具权限只能继承或收窄。拒绝、超时、步数耗尽和工具失败不会被标成 `completed`。
+- 文件覆盖使用路径锁、临时文件、`fsync` 和 `os.replace`；审批期间目标发生变化时拒绝覆盖。
+
+真实 `Deepseek-v4-flash` 安全/机制 A/B 共 240 次：单 Agent 正确率 100%、P50 5.704s；层级 Agent 正确率 97.5%、P50 6.781s。两组未授权副作用、重复副作用和失败误报完成均为 0。
+
+新的自主委派 A/B 使用上线评审、事故定位、接口变更审查和简单值班查询，共 8 个正常用户任务、16 次运行；提示词不要求委派，成功只看答案和证据。两组正确率和证据获取率均为 100%，6 个复杂任务中自主委派 1 次，2 个简单任务误委派 0 次。唯一实际委派样本耗时为单 Agent 的 1.11 倍，但输入 Token 降至 47.07%。因此当前实现默认由主 Agent 直接完成；只有多条独立调查线需要多步判断、专业分工或上下文隔离时才考虑委派。完整结果见 `artifacts/subagent_autonomy_benchmark_final.json`。
+
+### **6. Skill 两阶段懒加载**
 
 Skill 启动时只扫描 `SKILL.md` 前部的 `name` 和 `description`，正文在 `help` 时按需读取，并通过 LRU + mtime 缓存避免重复 I/O。
 
@@ -259,7 +271,7 @@ Skill 启动时只扫描 `SKILL.md` 前部的 `name` 和 `description`，正文�
 2. `mode="run"`：执行技能命令，复用同一套 Policy 和安全执行环境；
 3. “先 help 后 run”目前主要由提示词引导，给LLM调用工具的后悔机会，并非状态机硬强制，可灵活调用。
 
-### **6. MCP 扩展**
+### **7. MCP 扩展**
 
 **外部 MCP 的实际使用流程**
 
