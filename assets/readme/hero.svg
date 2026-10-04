@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="410" viewBox="0 0 1200 410" role="img" aria-labelledby="title desc">
+  <title id="title">FluxAgent — a reliable agent runtime</title>
+  <desc id="desc">FluxAgent coordinates routing, policy checks, approval, tool execution, and recovery in one observable agent workflow.</desc>
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fbfaf7"/>
+      <stop offset="1" stop-color="#eef3f4"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M1 1L11 6L1 11Z" fill="#16877f"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="410" rx="28" fill="url(#paper)"/>
+  <path d="M48 48H1152M48 362H1152" stroke="#d9e0e2" stroke-width="1"/>
+  <path d="M650 48V362" stroke="#d9e0e2" stroke-width="1"/>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif">
+    <text x="64" y="82" fill="#16877f" font-size="18" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" letter-spacing="2">AGENT EXECUTION CONTROL PLANE</text>
+    <text x="64" y="154" fill="#14263d" font-size="64" font-weight="700">FluxAgent</text>
+    <text x="66" y="198" fill="#30445a" font-size="27">面向真实工具执行的可恢复 Agent Runtime</text>
+    <text x="66" y="242" fill="#687685" font-size="20">让规划、权限、工具调用、记忆和恢复进入同一条可观测执行链。</text>
+    <rect x="64" y="285" width="230" height="42" rx="21" fill="#e0f2ef" stroke="#16877f"/>
+    <text x="179" y="312" fill="#176b66" font-size="18" text-anchor="middle">Stateful workflow</text>
+    <rect x="306" y="285" width="190" height="42" rx="21" fill="#eeeafd" stroke="#7463c4"/>
+    <text x="401" y="312" fill="#5b4ba7" font-size="18" text-anchor="middle">Policy controlled</text>
+    <text x="66" y="385" fill="#7b8792" font-size="17" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">Python  ·  LangGraph  ·  SQLite  ·  MCP</text>
+  </g>
+  <g transform="translate(688 72)" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif">
+    <rect width="464" height="266" rx="20" fill="#ffffff" stroke="#cfd9dc" stroke-width="2"/>
+    <text x="28" y="38" fill="#14263d" font-size="20" font-weight="600">Reliable execution loop</text>
+    <text x="28" y="65" fill="#778493" font-size="17" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">request → decision → evidence → next step</text>
+    <rect x="28" y="98" width="96" height="72" rx="12" fill="#e0f2ef" stroke="#16877f" stroke-width="2"/>
+    <rect x="148" y="98" width="96" height="72" rx="12" fill="#eeeafd" stroke="#7463c4" stroke-width="2"/>
+    <rect x="268" y="98" width="96" height="72" rx="12" fill="#fff1df" stroke="#c77d28" stroke-width="2"/>
+    <rect x="388" y="98" width="48" height="72" rx="12" fill="#e7f3e5" stroke="#5b9c58" stroke-width="2"/>
+    <path d="M124 134H148" fill="none" stroke="#16877f" stroke-width="3" marker-end="url(#arrow)"/>
+    <path d="M244 134H268" fill="none" stroke="#16877f" stroke-width="3" marker-end="url(#arrow)"/>
+    <path d="M364 134H388" fill="none" stroke="#16877f" stroke-width="3" marker-end="url(#arrow)"/>
+    <text x="76" y="126" fill="#176b66" font-size="18" font-weight="600" text-anchor="middle">Route</text>
+    <text x="76" y="150" fill="#4c7774" font-size="15" text-anchor="middle">能力</text>
+    <text x="196" y="126" fill="#5b4ba7" font-size="18" font-weight="600" text-anchor="middle">Guard</text>
+    <text x="196" y="150" fill="#756ca0" font-size="15" text-anchor="middle">策略</text>
+    <text x="316" y="126" fill="#a46620" font-size="18" font-weight="600" text-anchor="middle">Approve</text>
+    <text x="316" y="150" fill="#9a774d" font-size="15" text-anchor="middle">确认</text>
+    <text x="412" y="126" fill="#4d824a" font-size="18" font-weight="600" text-anchor="middle">Run</text>
+    <text x="412" y="150" fill="#62835f" font-size="15" text-anchor="middle">工具</text>
+    <path d="M412 194V220H76V170" fill="none" stroke="#16877f" stroke-width="3" marker-end="url(#arrow)"/>
+    <text x="244" y="248" fill="#5c6e78" font-size="17" text-anchor="middle">Progress  ·  retry  ·  replan  ·  end</text>
+  </g>
+</svg>

@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="500" viewBox="0 0 1200 500" role="img" aria-labelledby="title desc">
+  <title id="title">FluxAgent execution workflow</title>
+  <desc id="desc">A request is routed, planned, checked, approved when necessary, executed through tools, and then continued, retried, replanned, or ended.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M1 1L11 6L1 11Z" fill="#5e7180"/>
+    </marker>
+    <marker id="teal-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M1 1L11 6L1 11Z" fill="#16877f"/>
+    </marker>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fbfaf7"/>
+      <stop offset="1" stop-color="#eef3f4"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="500" rx="28" fill="url(#paper)"/>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif">
+    <text x="56" y="58" fill="#16877f" font-size="17" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" letter-spacing="2">EXECUTION WORKFLOW</text>
+    <text x="56" y="98" fill="#14263d" font-size="32" font-weight="700">把一次请求变成可恢复的执行闭环</text>
+    <text x="56" y="130" fill="#687685" font-size="19">模型负责提出下一步，状态图、策略和工具网关负责约束结果。</text>
+    <rect x="56" y="188" width="148" height="116" rx="16" fill="#e0f2ef" stroke="#16877f" stroke-width="2"/>
+    <rect x="276" y="188" width="148" height="116" rx="16" fill="#eeeafd" stroke="#7463c4" stroke-width="2"/>
+    <rect x="496" y="188" width="148" height="116" rx="16" fill="#f1f4f6" stroke="#7d8c99" stroke-width="2"/>
+    <rect x="716" y="188" width="148" height="116" rx="16" fill="#fff1df" stroke="#c77d28" stroke-width="2"/>
+    <rect x="936" y="188" width="148" height="116" rx="16" fill="#e7f3e5" stroke="#5b9c58" stroke-width="2"/>
+    <path d="M204 246H276" fill="none" stroke="#5e7180" stroke-width="3" marker-end="url(#arrow)"/>
+    <path d="M424 246H496" fill="none" stroke="#5e7180" stroke-width="3" marker-end="url(#arrow)"/>
+    <path d="M644 246H716" fill="none" stroke="#5e7180" stroke-width="3" marker-end="url(#arrow)"/>
+    <path d="M864 246H936" fill="none" stroke="#5e7180" stroke-width="3" marker-end="url(#arrow)"/>
+    <text x="130" y="225" fill="#176b66" font-size="21" font-weight="600" text-anchor="middle">Route</text>
+    <text x="130" y="256" fill="#4c7774" font-size="17" text-anchor="middle">识别能力</text>
+    <text x="130" y="281" fill="#4c7774" font-size="16" text-anchor="middle">契约范围</text>
+    <text x="350" y="225" fill="#5b4ba7" font-size="21" font-weight="600" text-anchor="middle">Plan</text>
+    <text x="350" y="256" fill="#756ca0" font-size="17" text-anchor="middle">拆分复杂任务</text>
+    <text x="350" y="281" fill="#756ca0" font-size="16" text-anchor="middle">依赖与步骤</text>
+    <text x="570" y="225" fill="#435566" font-size="21" font-weight="600" text-anchor="middle">Guard</text>
+    <text x="570" y="256" fill="#647481" font-size="17" text-anchor="middle">策略和参数</text>
+    <text x="570" y="281" fill="#647481" font-size="16" text-anchor="middle">越权即拒绝</text>
+    <text x="790" y="225" fill="#a46620" font-size="21" font-weight="600" text-anchor="middle">Approve</text>
+    <text x="790" y="256" fill="#9a774d" font-size="17" text-anchor="middle">副作用暂停</text>
+    <text x="790" y="281" fill="#9a774d" font-size="16" text-anchor="middle">人工确认</text>
+    <text x="1010" y="225" fill="#4d824a" font-size="21" font-weight="600" text-anchor="middle">Execute</text>
+    <text x="1010" y="256" fill="#62835f" font-size="17" text-anchor="middle">工具证据</text>
+    <text x="1010" y="281" fill="#62835f" font-size="16" text-anchor="middle">结果回到状态图</text>
+    <rect x="438" y="354" width="264" height="76" rx="16" fill="#e0f2ef" stroke="#16877f" stroke-width="2"/>
+    <path d="M1010 304V354H702" fill="none" stroke="#16877f" stroke-width="3" marker-end="url(#teal-arrow)"/>
+    <text x="570" y="384" fill="#176b66" font-size="20" font-weight="600" text-anchor="middle">Progress</text>
+    <text x="570" y="410" fill="#4c7774" font-size="17" text-anchor="middle">continue · retry · replan · end</text>
+    <path d="M438 392H350V304" fill="none" stroke="#5e7180" stroke-width="3" marker-end="url(#arrow)"/>
+    <path d="M702 392H1010V304" fill="none" stroke="#5e7180" stroke-width="3" marker-end="url(#arrow)"/>
+    <text x="394" y="382" fill="#687685" font-size="16" text-anchor="middle">失败：有限重试或换计划</text>
+    <text x="856" y="382" fill="#687685" font-size="16" text-anchor="middle">完成、失败、取消或超预算</text>
+  </g>
+</svg>
