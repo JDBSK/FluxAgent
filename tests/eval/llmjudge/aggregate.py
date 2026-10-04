@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """聚合与报告（prompt.md 07 的落地）：任务通过率、已决通过率、门禁、
-12 维质量分（evidence_coverage 同步呈现）、Wilson 区间、分族表现。
+可选语义质量分（evidence_coverage 同步呈现）、Wilson 区间、分族表现。
 """
 from __future__ import annotations
 
@@ -143,7 +143,7 @@ def render_markdown(summary: dict, results: list[dict], config_note: str) -> str
         for gate_id, counts in summary["gates"].items():
             lines.append(f"| {gate_id} | {counts['pass']} | {counts['fail']} | {counts['unknown']} |")
     else:
-        lines.append("本批无门禁触发（替身试跑：门禁以程序断言形式执行）。")
+        lines.append("本批场景未触发独立门禁；工具调用和记忆写入仍由程序断言检查。")
     lines.append("")
     lines.append("## 场景族表现")
     lines.append("")
@@ -153,13 +153,23 @@ def render_markdown(summary: dict, results: list[dict], config_note: str) -> str
         c = s["counts"]
         lines.append(f"| {fam} | {s['n']} | {c['pass']} | {c['fail']} | {c['inconclusive']} |")
     lines.append("")
-    if summary.get("quality"):
-        lines.append("## 12 维质量分（仅真实 judge trial）")
+    quality = summary.get("quality") or {}
+    scored_quality = {
+        fam: value for fam, value in quality.items()
+        if value.get("observed_quality") is not None
+    }
+    if scored_quality:
+        lines.append("## 语义质量分（仅真实 judge 返回分数时展示）")
         lines.append("")
         lines.append("| 族 | observed_quality | evidence_coverage | [lower, upper] |")
         lines.append("|---|---|---|---|")
-        for fam, q in summary["quality"].items():
+        for fam, q in scored_quality.items():
             lines.append(f"| {fam} | {q['observed_quality']} | {q['evidence_coverage']} | [{q['quality_lower']}, {q['quality_upper']}] |")
+        lines.append("")
+    elif quality:
+        lines.append("## 语义质量分")
+        lines.append("")
+        lines.append("本批 Judge 未返回维度分数，因此不计算语义质量分；仅报告程序验收和整体 pass/fail。")
         lines.append("")
     lines.append("## 失败案例")
     lines.append("")

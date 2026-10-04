@@ -26,7 +26,6 @@ SAFE_TOOLS = ["get_current_time", "calculator", "list_office_files", "read_offic
 DANGER_TOOLS = [
     "write_office_file",
     "execute_office_shell",
-    "save_user_profile",
     "schedule_task",
     "delete_scheduled_task",
     "modify_scheduled_task",
@@ -75,7 +74,7 @@ def hitl_cases() -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     for tool in DANGER_TOOLS:
         for decision in ("approve", "reject"):
-            for n_calls in (1, 2, 3):
+            for n_calls in (1, 2, 3, 4):
                 cases.append({
                     "id": f"hitl_gate_{tool}_{decision}_{n_calls}",
                     "kind": "gate",

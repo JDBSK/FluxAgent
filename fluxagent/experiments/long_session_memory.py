@@ -2,8 +2,8 @@
 """长会话记忆回归：60 轮域切换会话，逐轮断言记忆行为（0 API）。
 
 针对"问答过长时记忆是问题高发区"的四个高发失效模式：
-  F1 跨域任务态泄漏：换域后旧域任务态仍被注入；
-  F2 任务态堆积：同会话任务记录不覆盖、越积越多；
+  F1 跨域经验泄漏：换域后其他域经验仍被注入；
+  F2 经验记录堆积：同一稳定 key 不覆盖、越积越多；
   F3 token 预算失守：历史增长后规则/契约段被挤掉或总量超限；
   F4 敏感/过期复活：长会话后期敏感记录或 TTL 过期记录重新进入 prompt。
 
@@ -83,7 +83,7 @@ def run(total_turns: int = TOTAL_TURNS) -> dict[str, Any]:
     )
     # TTL 过期记录（会话开始前就过期）
     store.add(
-        MemoryScope.TASK_STATE, "过期任务：远古清单", key="task.expired",
+        MemoryScope.EPISODIC, "过期任务：远古清单", key="task.expired",
         ttl_seconds=1, now=1.0, session_id=SESSION_ID,
     )
 
@@ -99,9 +99,9 @@ def run(total_turns: int = TOTAL_TURNS) -> dict[str, Any]:
         capability_id = f"mcp.{domain}"
         user_text = f"第{turn}轮：处理{domain}域请求"
 
-        # 模拟真实 agent：每回合写 task_state（同 key 覆盖）
+        # 模拟真实 agent：每回合写当前域经验（同 key 覆盖）
         store.add(
-            MemoryScope.TASK_STATE,
+            MemoryScope.EPISODIC,
             f"当前任务：{user_text}",
             key=f"task:{SESSION_ID}",
             source_id="agent_node",
@@ -127,7 +127,7 @@ def run(total_turns: int = TOTAL_TURNS) -> dict[str, Any]:
                 route="route",
                 intent=f"{domain}_intent",
                 capability_ids=(capability_id,),
-                memory_scopes=("user_fact", "task_state", "episodic"),
+                memory_scopes=("user_fact", "episodic"),
                 history_digest=history_digest,
                 session_id=SESSION_ID,
             )
@@ -135,7 +135,7 @@ def run(total_turns: int = TOTAL_TURNS) -> dict[str, Any]:
         prompt = compiled.system_prompt
 
         turn_violations: list[str] = []
-        # F1: 注入的记忆记录必须属于本域（episodic/task_state 泄漏均可检），
+        # F1: 注入的记忆记录必须属于本域，
         # 全局记录（无 capability 标签）除外；prompt 子串作第二层
         for memory in compiled.memory:
             for other in ("market", "cooking", "weather", "translate", "docs"):
@@ -165,11 +165,11 @@ def run(total_turns: int = TOTAL_TURNS) -> dict[str, Any]:
         )
         previous_capability = capability_id
 
-    # F2: 记忆库有界性——task:{session} 同 key 覆盖，task_state 只能有 1 条
+    # F2: 记忆库有界性——task:{session} 同 key 覆盖，只能有 1 条
     # （episodic 按设计逐条累积，受 TTL 约束）
     task_records = [
         r for r in store.all_records()
-        if r.scope == MemoryScope.TASK_STATE and r.session_id == SESSION_ID
+        if r.scope == MemoryScope.EPISODIC and r.session_id == SESSION_ID
     ]
     if len(task_records) > 1:
         violations["F2_task_accumulation"] += len(task_records) - 1

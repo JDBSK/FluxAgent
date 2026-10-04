@@ -367,11 +367,11 @@ def run_track_b() -> list[dict]:
     store.add(MemoryScope.USER_FACT, "保险柜密码 0000", key="profile.secret", sensitivity="sensitive")
     store.add(MemoryScope.USER_PREFERENCE, "最终报告只能用中文输出", key="profile.lang")
     store.add(
-        MemoryScope.TASK_STATE, "正在分析贵州茅台K线", key="task.market",
+        MemoryScope.EPISODIC, "正在分析贵州茅台K线", key="task.market",
         capability_tags=("mcp.market",),
     )
     store.add(
-        MemoryScope.TASK_STATE, "本周菜谱已排周一到周三", key="task.cooking",
+        MemoryScope.EPISODIC, "本周菜谱已排周一到周三", key="task.cooking",
         capability_tags=("mcp.cooking",),
     )
     store.add(
@@ -384,7 +384,7 @@ def run_track_b() -> list[dict]:
     )
     # TTL 过期记录：不应注入
     store.add(
-        MemoryScope.TASK_STATE, "已过期：去年圣诞菜单", key="task.expired",
+        MemoryScope.EPISODIC, "已过期：去年圣诞菜单", key="task.expired",
         capability_tags=("mcp.cooking",), ttl_seconds=1, now=1.0,
     )
     compiler = ContextCompiler(store, token_budget=3000)
@@ -406,7 +406,7 @@ def run_track_b() -> list[dict]:
             route="route",
             intent="recommend_meal",
             capability_ids=("mcp.cooking",),
-            memory_scopes=("user_fact", "user_preference", "task_state", "episodic"),
+            memory_scopes=("user_fact", "user_preference", "episodic"),
         )
     )
     check(
@@ -421,7 +421,7 @@ def run_track_b() -> list[dict]:
             route="route",
             intent="quote_lookup",
             capability_ids=("mcp.market",),
-            memory_scopes=("user_fact", "user_preference", "task_state", "episodic"),
+            memory_scopes=("user_fact", "user_preference", "episodic"),
         )
     )
     check(
@@ -441,13 +441,13 @@ def run_track_b() -> list[dict]:
     )
     # 记忆选择 precision/recall：无标签记录（通用事实/通用经验）对所有能力可见；
     # 带能力标签的记录只进对应能力；敏感与过期一律排除
-    # record_id 带 scope 前缀（user_fact:/task_state:/episodic:）
+    # record_id 带 scope 前缀（user_fact:/user_preference:/episodic:）
     memory_cases = [
         (
             "mcp.cooking",
             {
                 "user_fact:profile.household", "user_fact:profile.allergy",
-                "user_preference:profile.lang", "task_state:task.cooking",
+                "user_preference:profile.lang", "episodic:task.cooking",
                 "episodic:ep.export.denied",
             },
         ),
@@ -455,7 +455,7 @@ def run_track_b() -> list[dict]:
             "mcp.market",
             {
                 "user_fact:profile.household", "user_fact:profile.allergy",
-                "user_preference:profile.lang", "task_state:task.market",
+                "user_preference:profile.lang", "episodic:task.market",
                 "episodic:ep.market.schema", "episodic:ep.export.denied",
             },
         ),
@@ -474,7 +474,7 @@ def run_track_b() -> list[dict]:
                 route="route" if capability_id else "answer_without_tools",
                 intent="",
                 capability_ids=(capability_id,) if capability_id else (),
-                memory_scopes=("user_fact", "user_preference", "task_state", "episodic"),
+                memory_scopes=("user_fact", "user_preference", "episodic"),
             )
         )
         injected = {m.record_id for m in snapshot.memory}

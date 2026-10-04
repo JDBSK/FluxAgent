@@ -72,6 +72,7 @@ def _risk_of_tool(tool: BaseTool) -> RiskLevel:
 
 
 def _slug(text: str) -> str:
+    """规范化字符串为能力ID片段,避免与 skill/mcp 冲突."""
     slug = re.sub(r"[^0-9A-Za-z_-]+", "_", str(text)).strip("_")
     return slug or "capability"
 
@@ -81,7 +82,7 @@ def builtin_descriptors(tools: Iterable[BaseTool]) -> list[CapabilityDescriptor]
     descriptors: list[CapabilityDescriptor] = []
     for tool in tools:
         name = str(tool.name)
-        capability_id = f"builtin.{_slug(name)}"
+        capability_id = f"builtin.{_slug(name)}"  # builtin 工具按名称分组，避免与 skill/mcp 冲突
         op = OperationDescriptor(
             capability_id=capability_id,
             name=name,

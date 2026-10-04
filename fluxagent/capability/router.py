@@ -48,6 +48,117 @@ _EXPLICIT_PATTERN = re.compile(
 )
 
 
+def _metadata_aliases(value: Any) -> set[str]:
+    """从能力元数据生成可检索的名称变体，不做语义推断。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return set()
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw)
+    spaced = re.sub(r"[_./:-]+", " ", spaced)
+    variants = {raw.casefold(), spaced.casefold().strip()}
+    stopwords = {
+        "mcp", "skill", "server", "backend", "service", "tool", "sdk",
+        "服务", "后端", "工具", "技能",
+    }
+    variants.update(
+        part
+        for part in spaced.casefold().split()
+        if len(part) >= 3 and part not in stopwords
+    )
+    if spaced.casefold().endswith(" mcp"):
+        variants.add(spaced[:-4].strip().casefold())
+    for match in re.finditer(r"[\u4e00-\u9fff]{2,}", raw):
+        phrase = match.group(0)
+        for start in range(len(phrase)):
+            for end in range(start + 2, len(phrase) + 1):
+                variants.add(phrase[start:end])
+    return {
+        item for item in variants
+        if len(item) >= 2 and (
+            any("\u4e00" <= char <= "\u9fff" for char in item)
+            or len(item) >= 3
+        )
+    }
+
+
+def _alias_occurrences(alias: str, text: str) -> list[tuple[int, int]]:
+    """返回别名在文本中的位置；英文使用词边界，中文使用子串。"""
+    if all(ord(char) < 128 for char in alias):
+        return [
+            (match.start(), match.end())
+            for match in re.finditer(
+                rf"(?<![a-z0-9_]){re.escape(alias)}(?![a-z0-9_])", text
+            )
+        ]
+    return [
+        (index, index + len(alias))
+        for index in range(len(text))
+        if text.startswith(alias, index)
+    ]
+
+
+def _explicit_occurrence_requested(text: str, start: int) -> bool:
+    """判断别名前是否存在正向使用指令，排除否定语句。"""
+    prefix = text[max(0, start - 32):start]
+    if re.search(r"(?:不要|别|禁止|不使用|不调用|无需使用|无需调用)[^。！？\n]{0,18}$", prefix):
+        return False
+    return re.search(
+        r"(?:用|使用|调用|切换到|选择)\s*$|"
+        r"(?:\buse\b|\bcall\b|\bswitch\s+to\b)\s*$",
+        prefix,
+        re.IGNORECASE,
+    ) is not None
+
+
+def resolve_explicit_capability(
+    text: str, snapshot: RegistrySnapshot
+) -> Optional[str]:
+    """统一解析用户是否明确要求某个已注册能力。
+
+    普通提及只返回 None，交给检索；正向指定但无法唯一解析返回空字符串，
+    由调用方澄清。这样不会因为“不要用 weather”中的名称出现而直达能力。
+    """
+    lowered = str(text or "").casefold()
+    alias_map: Dict[str, set[str]] = {}
+    for capability in snapshot.enabled_capabilities():
+        if capability.kind == "builtin":
+            continue
+        sources = [capability.capability_id, capability.name, *capability.aliases]
+        sources.extend(operation.name for operation in capability.operations)
+        for source in sources:
+            for alias in _metadata_aliases(source):
+                alias_map.setdefault(alias, set()).add(capability.capability_id)
+
+    matches: list[tuple[int, str]] = []
+    for alias, capability_ids in alias_map.items():
+        requested = any(
+            _explicit_occurrence_requested(lowered, start)
+            for start, _ in _alias_occurrences(alias, lowered)
+        )
+        if not requested:
+            continue
+        if len(capability_ids) > 1:
+            # 同一显式名称对应多个能力，不能静默选第一个。
+            return ""
+        if len(capability_ids) == 1:
+            matches.append((len(alias), next(iter(capability_ids))))
+    if matches:
+        best_length = max(length for length, _ in matches)
+        best = {
+            capability_id
+            for length, capability_id in matches
+            if length == best_length
+        }
+        return next(iter(best)) if len(best) == 1 else ""
+
+    hint = _EXPLICIT_PATTERN.search(str(text or ""))
+    if hint and _explicit_occurrence_requested(
+        str(text or "").casefold(), hint.start(1)
+    ):
+        return ""
+    return None
+
+
 # ---------- 数据结构 ----------
 
 @dataclass(frozen=True)
@@ -102,10 +213,12 @@ class Candidate:
     score: float
     capability: CapabilityDescriptor
     operation: Optional[OperationDescriptor] = None
+    # 该候选是否被真实 embedding 检索到；仅用于避免词面覆盖门槛误杀语义命中。
+    dense_score: Optional[float] = None
 
 
 class HeuristicReranker:
-    """无模型重排：绝对证据门槛 + RRF 排序信号 + 反例/健康/缺槽位惩罚。
+    """无模型重排：绝对证据门槛 + RRF 排序信号 + 反例/健康惩罚。
 
     v3 语义：
     - 准入（evidence gate）用绝对量——查询词对全量能力卡的覆盖率；低于
@@ -151,8 +264,14 @@ class HeuristicReranker:
             if candidate.operation is not None:
                 text_tokens.update(tokenize(candidate.operation.description))
             coverage = len(query_tokens & text_tokens) / max(1, len(denom_tokens))
-            if coverage < self.min_coverage:
-                continue  # 证据不足：该候选不可路由
+            if (
+                coverage < self.min_coverage
+                and not (
+                    candidate.dense_score is not None
+                    and candidate.dense_score > 0.0
+                )
+            ):
+                continue  # 词面证据不足且没有正向语义证据
             rrf_norm = candidate.score / max_fused
             negative_hits = sum(
                 1
@@ -167,13 +286,11 @@ class HeuristicReranker:
             }[cap.provider_health]
             if health_penalty >= 1.0:
                 continue  # 不可用能力在检索序模式下也无条件排除（与显式路径一致）
-            missing = _missing_required_slots(candidate, query)
             score = (
                 0.7 * coverage
                 + 0.3 * rrf_norm
                 - 0.5 * negative_hits
                 - health_penalty
-                - 0.1 * len(missing)
             )
             scored.append((candidate, score))
         if self.order_by == "retrieval":
@@ -538,40 +655,11 @@ class HybridRouter:
         True 返回 None（回落检索，供短步骤文本等生成式输入使用）；默认 False
         返回 ""（fail-closed clarify，用户显式点名未注册后端必须澄清）。
         """
-        alias_map: Dict[str, List[str]] = {}
-        for capability in snapshot.enabled_capabilities():
-            if capability.kind == "builtin":
-                continue
-            aliases = set()
-            aliases.add(capability.capability_id.casefold())
-            aliases.add(capability.name.strip().casefold())
-            for alias in capability.aliases:
-                normalized = alias.strip().casefold()
-                if len(normalized) >= 2:
-                    aliases.add(normalized)
-            for alias in aliases:
-                alias_map.setdefault(alias, []).append(capability.capability_id)
-
-        lowered = text.casefold()
-        matches: List[Tuple[int, str]] = []
-        for alias, capability_ids in alias_map.items():
-            if len(alias) >= 2 and self._alias_in_text(alias, lowered):
-                if len(capability_ids) > 1:
-                    # 同名别名跨能力共享：无法唯一解析，必须 clarify 而非静默取第一个
-                    return ""
-                matches.append((len(alias), capability_ids[0]))
-        if matches:
-            matches.sort(reverse=True)
-            best_len = matches[0][0]
-            best = {cap_id for length, cap_id in matches if length == best_len}
-            if len(best) == 1:
-                return next(iter(best))
-            return ""  # 歧义：显式信号存在但无法唯一解析 → clarify
-
-        hint = _EXPLICIT_PATTERN.search(text)
-        if hint:
-            return "" if not hint_fallback_to_retrieval else None
-        return None
+        resolved = resolve_explicit_capability(text, snapshot)
+        if resolved == "" and hint_fallback_to_retrieval:
+            # 仅供步骤文本等生成式输入使用；用户主请求默认 fail-closed。
+            return None
+        return resolved
 
     def _decide_explicit(
         self, capability_id: str, text: str, snapshot: RegistrySnapshot
@@ -628,15 +716,17 @@ class HybridRouter:
         try:
             bm25_ranking = self._bm25.search(retrieval_text, top_k=self.top_k)
             rankings = [bm25_ranking]
+            dense_ranking: List[Tuple[str, float]] = []
             # 双路融合只在第二路具备真实语义信号时启用；确定性哈希向量本质
             # 是词面信息的向量重排，参与 RRF 只会稀释 BM25 的 IDF 信号
             # （检索指标实测：0.83→0.44），故此场景退化为单路词法检索。
             from .retrieval import DeterministicEmbedding
 
             if not isinstance(self.embedding_provider, DeterministicEmbedding):
-                rankings.append(
-                    self._dense.search(retrieval_text, self.embedding_provider, top_k=self.top_k)
+                dense_ranking = self._dense.search(
+                    retrieval_text, self.embedding_provider, top_k=self.top_k
                 )
+                rankings.append(dense_ranking)
         except EmbeddingError as exc:
             return self._decision(
                 route="unavailable",
@@ -661,6 +751,7 @@ class HybridRouter:
             if entry is None:
                 continue
             capability, operation = entry
+            dense_score = dict(dense_ranking).get(doc_id)
             candidates.append(
                 Candidate(
                     doc_id=doc_id,
@@ -671,6 +762,7 @@ class HybridRouter:
                     score=fused_score,
                     capability=capability,
                     operation=operation,
+                    dense_score=dense_score,
                 )
             )
         ranked = self.reranker.rerank(
@@ -777,7 +869,7 @@ class HybridRouter:
         ]
         missing = sorted(min(per_op_missing, key=len)) if per_op_missing else []
         intent = capability.intents[0] if capability.intents else capability.capability_id
-        memory_scopes = ("user_fact", "user_preference", "task_state", "episodic")
+        memory_scopes = ("user_fact", "user_preference", "episodic")
         return self._decision(
             route="route",
             intent=intent,

@@ -187,6 +187,17 @@ def run_judge(case: dict, evidence: dict, judge_provider, retry_limit: int = 3) 
         },
         "independent_checks": evidence["independent_checks"],
     }
+    if case.get("family") == "M":
+        # Memory cases use synthetic conversations; include only the five
+        # structured proposal fields, never arbitrary tool arguments.
+        user_payload["execution"]["memory_proposals"] = [
+            {
+                key: str((call.get("args") or {}).get(key) or "")[:500]
+                for key in ("operation", "scope", "semantic_key", "value", "evidence")
+            }
+            for call in evidence.get("model_tool_calls", [])
+            if call.get("name") == "propose_memory_change"
+        ]
     from langchain_core.messages import HumanMessage, SystemMessage
     # 紧凑输出契约：裁判只产出 task_success/scores/summary，
     # 完整 12 维结构由宿主组装——把生成时延砍到最低（免费通道 ~1-3 tok/s）

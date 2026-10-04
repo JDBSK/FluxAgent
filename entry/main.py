@@ -177,7 +177,13 @@ def print_banner():
 
 def cprint(text="", end="\n"):
     """输出包含 ANSI 样式的终端文本。"""
-    print_formatted_text(ANSI(str(text)), end=end)
+    try:
+        print_formatted_text(ANSI(str(text)), end=end)
+    except Exception:
+        # Piped/CI execution has no Win32 console buffer. Keep `run` usable
+        # for smoke tests and redirected logs; an interactive CMD still uses
+        # prompt_toolkit's styled output.
+        print(str(text), end=end)
 
 
 def render_terminal_status(values: dict) -> str:
@@ -267,6 +273,7 @@ async def async_main():
             permission_broker=permission_broker,
             capability_registry=capability_registry,  # 统一能力注册表
             policy=policy,
+            enable_memory_worker=True,
         )  # 创建 Agent 应用,用于处理用户输入、调用工具和管理会话状态
         if getattr(app, "subagent_runner", None) is not None:
             await app.subagent_runner.cleanup_terminal_checkpoints()

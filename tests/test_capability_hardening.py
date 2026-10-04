@@ -168,7 +168,7 @@ class TestHeuristicRerankerOrders(unittest.TestCase):
 
 
 class TestMemoryWriteSide(unittest.TestCase):
-    def test_agent_writes_task_state_and_episodic_memory(self):
+    def test_agent_writes_verified_episodic_memory(self):
         from fluxagent.capability.descriptors import OperationDescriptor
         from fluxagent.capability.providers import builtin_descriptors
         from fluxagent.core.agent import create_agent_app
@@ -202,9 +202,6 @@ class TestMemoryWriteSide(unittest.TestCase):
             )
 
         record_ids = {r.record_id for r in store.all_records()}
-        # task_state 生产者：仅在外部能力被路由时写入（builtin-only 回合不产生任务态）
-        self.assertNotIn("task:mem-test", record_ids)
-        self.assertNotIn("task:mem-test@@mem-test", record_ids)
         # episodic 生产者：工具失败已写入（calculator 对非法表达式返回失败）
         episodic = [r for r in store.all_records() if r.record_id.startswith("episodic:")]
         self.assertTrue(episodic, "工具失败应写入 episodic 记忆")
@@ -215,7 +212,7 @@ class TestMemoryWriteSide(unittest.TestCase):
         """跨任务泄漏回归：abstain 回合不得看到其他能力的带标签记忆。"""
         store = MemoryStore()
         store.add(
-            MemoryScope.TASK_STATE, "正在分析茅台", key="task.market",
+            MemoryScope.EPISODIC, "正在分析茅台", key="task.market",
             capability_tags=("mcp.market",),
         )
         store.add(MemoryScope.USER_FACT, "通用事实", key="profile.generic")
@@ -224,13 +221,13 @@ class TestMemoryWriteSide(unittest.TestCase):
             CompilationContext(user_text="1加1", route="answer_without_tools")
         )
         self.assertNotIn("茅台", snapshot.system_prompt)
-        self.assertIn("通用事实", snapshot.system_prompt)
+        self.assertNotIn("通用事实", snapshot.system_prompt)
 
     def test_cross_session_memory_boundary(self):
-        """跨会话数据边界：会话 A 的任务态不得进入会话 B；全局记录不受限。"""
+        """跨会话数据边界：会话 A 的经验不得进入会话 B；全局记录不受限。"""
         store = MemoryStore()
         store.add(
-            MemoryScope.TASK_STATE, "会话A正在分析茅台", key="task:A",
+            MemoryScope.EPISODIC, "会话A正在分析茅台", key="task:A",
             capability_tags=("mcp.market",), session_id="session-A",
         )
         store.add(
@@ -243,9 +240,9 @@ class TestMemoryWriteSide(unittest.TestCase):
         # 会话 B 的市场请求：不得看到会话 A 的任何记录，全局事实可见
         snapshot_b = compiler.compile(
             CompilationContext(
-                user_text="看盘", route="route", intent="quote_lookup",
+                user_text="看盘和对虾过敏原", route="route", intent="quote_lookup",
                 capability_ids=("mcp.market",),
-                memory_scopes=("user_fact", "task_state", "episodic"),
+                memory_scopes=("user_fact", "episodic"),
                 session_id="session-B",
             )
         )
@@ -255,9 +252,9 @@ class TestMemoryWriteSide(unittest.TestCase):
         # 会话 A 自己的请求：可见本会话记录
         snapshot_a = compiler.compile(
             CompilationContext(
-                user_text="看盘", route="route", intent="quote_lookup",
+                user_text="看盘和茅台K线", route="route", intent="quote_lookup",
                 capability_ids=("mcp.market",),
-                memory_scopes=("user_fact", "task_state", "episodic"),
+                memory_scopes=("user_fact", "episodic"),
                 session_id="session-A",
             )
         )
@@ -268,7 +265,7 @@ class TestMemoryWriteSide(unittest.TestCase):
             CompilationContext(
                 user_text="看盘", route="route", intent="quote_lookup",
                 capability_ids=("mcp.market",),
-                memory_scopes=("user_fact", "task_state", "episodic"),
+                memory_scopes=("user_fact", "episodic"),
             )
         )
         self.assertNotIn("会话A", snapshot_noctx.system_prompt)

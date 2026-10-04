@@ -187,6 +187,10 @@ class TestHybridRouter(unittest.TestCase):
         self.assertEqual(decision.route, "route")
         self.assertEqual(decision.capability_ids, ("cap.cooking",))
 
+    def test_mention_or_negation_does_not_take_explicit_path(self):
+        decision = self.router.decide("不要用 weather，解释天气预报原理", self.snapshot)
+        self.assertNotEqual(decision.audit.get("path"), "explicit")
+
     def test_explicit_unregistered_fails_closed(self):
         decision = self.router.decide("使用天气服务查天气", build_registry([]).snapshot())
         self.assertIn(decision.route, {"clarify", "unavailable", "answer_without_tools"})
@@ -274,6 +278,28 @@ class TestHybridRouter(unittest.TestCase):
 
 
 class TestHeuristicReranker(unittest.TestCase):
+    def test_dense_hit_survives_without_shared_query_words(self):
+        weather = make_capability(
+            "cap.weather",
+            name="Weather",
+            description="查询城市天气温度降雨",
+        )
+        reranker = HeuristicReranker()
+        candidate = __import__(
+            "fluxagent.capability.router", fromlist=["Candidate"]
+        ).Candidate(
+            doc_id="cap:cap.weather",
+            capability_id="cap.weather",
+            kind="mcp",
+            name="Weather",
+            text=weather.searchable_text(),
+            score=0.9,
+            capability=weather,
+            dense_score=0.82,
+        )
+        ranked = reranker.rerank("明天出门带伞", [candidate])
+        self.assertEqual([item[0].capability_id for item in ranked], ["cap.weather"])
+
     def test_negative_example_penalized(self):
         cooking = make_capability(
             "cap.cooking",

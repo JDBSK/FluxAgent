@@ -23,6 +23,7 @@ from unittest.mock import patch
 from langchain_core.messages import HumanMessage
 
 from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import MemorySaver
 
 from fluxagent.core.tools import builtins as builtins_mod
 from fluxagent.core.tools.builtins import BUILTIN_TOOLS
@@ -30,14 +31,20 @@ from fluxagent.core import skill_loader as skill_loader_mod
 from fluxagent.core import subagents as subagents_mod
 from fluxagent.core.tools import sandbox_tools
 from fluxagent.core.tools.builtins import tasks_lock
+from fluxagent.capability.context_compiler import MemoryScope, MemoryStore, ProfileCompatProvider
+from fluxagent.core.approval import approve, pending_approval
+from fluxagent.core.agent import _grounded_memory_evidence
 
 
 class StubModel:
     """按脚本顺序执行的替身模型：工具调用 / 最终回答 / 宿主动作。"""
 
-    def __init__(self, script: list[dict], harness_cb=None):
+    def __init__(self, script: list[dict], harness_cb=None,
+                 turn_scripts: list[list[dict]] | None = None):
         self.script = list(script)
+        self.turn_scripts = [list(items) for items in (turn_scripts or [])]
         self.index = 0
+        self.turn_indexes: dict[int, int] = {}
         self.harness_cb = harness_cb or (lambda action: None)
         self.calls: list[tuple[list, dict | None]] = []
         self.context: dict[str, str] = {}
@@ -67,9 +74,26 @@ class StubModel:
                 if match:
                     self.context["token"] = match.group(1)
                 break
-        while self.index < len(self.script):
-            step = self.script[self.index]
-            self.index += 1
+        configurable = (config or {}).get("configurable", {})
+        configured_turn = configurable.get("stub_turn_index")
+        if configured_turn is None:
+            human_count = sum(1 for message in messages if getattr(message, "type", "") == "human")
+            turn_index = max(0, human_count - 1)
+        else:
+            turn_index = max(0, int(configured_turn))
+        if self.turn_scripts:
+            script = self.turn_scripts[min(turn_index, len(self.turn_scripts) - 1)]
+            index = self.turn_indexes.get(turn_index, 0)
+        else:
+            script = self.script
+            index = self.index
+        while index < len(script):
+            step = script[index]
+            index += 1
+            if self.turn_scripts:
+                self.turn_indexes[turn_index] = index
+            else:
+                self.index = index
             if "harness" in step:
                 self.harness_cb(step)
                 continue
@@ -138,25 +162,39 @@ class TrialRunner:
     """跑单个 trial 并产出证据包 + 程序断言结果。"""
 
     def __init__(self, provider_name: str | None = None, model_name: str | None = None,
-                 key_pool=None, base_url: str | None = None, sut_model: str | None = None):
+                 key_pool=None, base_url: str | None = None, sut_model: str | None = None,
+                 run_id: str = ""):
         self.provider_name = provider_name
         self.model_name = model_name
         self.key_pool = key_pool
         self.base_url = base_url
         self.sut_model = sut_model
+        self.run_id = str(run_id or "").strip()
 
     def run(self, case: dict, trial_index: int = 0, stub: bool = True) -> dict:
         started = time.time()
-        trial_id = f"{case['case_id']}-t{trial_index}-{'stub' if stub else 'real'}"
+        prefix = f"{self.run_id}-" if self.run_id else ""
+        trial_id = f"{prefix}{case['case_id']}-t{trial_index}-{'stub' if stub else 'real'}"
         with tempfile.TemporaryDirectory(prefix="fluxjudge-") as tmp:
             office_dir = os.path.join(tmp, "office")
             skills_dir = os.path.join(office_dir, "skills")
+            memory_dir = os.path.join(tmp, "memory")
             os.makedirs(office_dir, exist_ok=True)
             os.makedirs(skills_dir, exist_ok=True)
+            os.makedirs(memory_dir, exist_ok=True)
             _materialize_fixtures(office_dir, skills_dir, case["fixtures"])
+            profile_content = case["fixtures"].get("memory_profile")
+            if profile_content is not None:
+                with open(os.path.join(memory_dir, "user_profile.md"), "w", encoding="utf-8") as fh:
+                    fh.write(str(profile_content))
 
             recorder = _EventRecorder()
             office_before = _hash_office(office_dir)
+            profile_before = ""
+            profile_path = os.path.join(memory_dir, "user_profile.md")
+            if os.path.exists(profile_path):
+                with open(profile_path, encoding="utf-8") as fh:
+                    profile_before = fh.read()
 
             host = case["host"]
             patches = [
@@ -165,7 +203,7 @@ class TrialRunner:
                 patch.object(subagents_mod, "audit_logger", recorder),
                 patch("fluxagent.core.agent.audit_logger", recorder),
                 # 每个 trial 独立画像目录：真实运行不得读写 workspace/memory
-                patch("fluxagent.core.agent.MEMORY_DIR", os.path.join(tmp, "memory")),
+                patch("fluxagent.core.agent.MEMORY_DIR", memory_dir),
             ]
             tasks_file = None
             if host.get("tasks_file"):
@@ -188,7 +226,10 @@ class TrialRunner:
                         # 子 Agent 模型在子图内（depth>=1）直接抛错，
                         # 用于验证主 Agent 对子任务 failed 状态的处理
                         stub_model.child_fails = True
-                stub_model = StubModel(case["stub"], harness_cb)
+                stub_model = StubModel(
+                    case["stub"], harness_cb,
+                    turn_scripts=case.get("stub_turns"),
+                )
                 patches.append(patch(
                     "fluxagent.core.agent.get_provider", return_value=stub_model))
                 # 子 Agent 的模型也用同一替身：脚本会在子图内继续执行
@@ -201,18 +242,38 @@ class TrialRunner:
             import functools
             import fluxagent.core.agent as fluxagent_core_agent
             from fluxagent.core.agent import create_agent_app
+            trial_memory_store = MemoryStore(
+                persist_path=os.path.join(memory_dir, "structured_memory.json")
+            )
+            if os.path.isfile(profile_path):
+                ProfileCompatProvider(profile_path).migrate_once(trial_memory_store)
+            for item in case["fixtures"].get("memory_records", []):
+                scope = MemoryScope(str(item["scope"]))
+                trial_memory_store.add(
+                    scope,
+                    str(item["value"]),
+                    key=f"profile.{item['semantic_key']}",
+                    source_id="synthetic_eval_fixture",
+                )
             kwargs: dict[str, Any] = {
                 "require_approval": bool(host.get("require_approval", False)),
                 "enable_planner": bool(host.get("enable_planner", True)),
                 # 真实运行使用 .env 配置的提供商/模型；替身模式下被 patch 覆盖
                 "provider_name": self.provider_name or _os.getenv("DEFAULT_PROVIDER", "openai"),
                 "model_name": self.model_name or _os.getenv("DEFAULT_MODEL", "gpt-4o-mini"),
+                # The harness owns the trial lifecycle. Use the same durable
+                # projection without starting a daemon worker per trial;
+                # worker recovery is covered by dedicated unit tests.
+                "memory_store": trial_memory_store,
+                "checkpointer": MemorySaver(),
             }
             if host.get("context_trigger_turns"):
                 kwargs["context_trigger_turns"] = host["context_trigger_turns"]
                 kwargs["context_keep_turns"] = host.get("context_keep_turns", 1)
             if host.get("enable_replan") is False:
                 kwargs["enable_replan"] = False
+            if host.get("memory_retrieval_mode"):
+                kwargs["memory_retrieval_mode"] = host["memory_retrieval_mode"]
             if not stub:
                 from fluxagent.core.budget import RunBudget
                 kwargs["budget"] = RunBudget(max_llm_calls=24, max_wall_seconds=240)
@@ -248,7 +309,10 @@ class TrialRunner:
                     tools = list(BUILTIN_TOOLS)
 
                 # 故障注入：目标 office 工具首次调用抛瞬时错误，验证恢复链路
-                harness_actions = [s.get("harness") for s in case.get("stub") or []]
+                scripted_steps = list(case.get("stub") or [])
+                for turn_script in case.get("stub_turns") or []:
+                    scripted_steps.extend(turn_script)
+                harness_actions = [s.get("harness") for s in scripted_steps]
                 if stub and "inject_error_once" in harness_actions:
                     fault_step = next(s for s in case["stub"] if s.get("harness") == "inject_error_once")
                     target_name = fault_step.get("target", "read_office_file")
@@ -279,17 +343,76 @@ class TrialRunner:
                 app = create_agent_app(tools=tools, enable_subagents=enable_sub, **kwargs)
 
                 config = {"configurable": {"thread_id": f"judge-{case['case_id']}-{trial_index}"}}
-                result = app.invoke({"messages": [HumanMessage(content=case["user_prompt"])]}, config)
-                final_answer = str(result["messages"][-1].content)
-                tool_messages = [
-                    {"tool": m.name, "content": str(m.content)[:600]}
-                    for m in result["messages"] if getattr(m, "type", "") == "tool"
-                ]
-                llm_calls = int(result.get("llm_calls") or 0)
+                turns = list(case.get("turns") or [case["user_prompt"]])
+                final_answer = ""
+                tool_messages = []
+                model_tool_calls = []
+                turn_evidence = []
+                previous_message_count = 0
+                result = {}
+                total_llm_calls = 0
+                for turn_index, turn in enumerate(turns):
+                    turn_config = {
+                        "configurable": {
+                            **config["configurable"],
+                            "stub_turn_index": turn_index,
+                        }
+                    }
+                    result = app.invoke(
+                        {"messages": [HumanMessage(content=str(turn))]}, turn_config
+                    )
+                    if case.get("family") == "M":
+                        pending = pending_approval(app, turn_config)
+                        if pending:
+                            result = approve(app, turn_config, pending)
+                    messages = list(result.get("messages") or [])
+                    # A checkpoint returns the complete thread. Only collect
+                    # the newly produced messages for this turn, otherwise
+                    # earlier tool results would be counted repeatedly.
+                    new_messages = messages[previous_message_count:]
+                    for message in new_messages:
+                        if case.get("family") == "M" and isinstance(message, AIMessage):
+                            for call in getattr(message, "tool_calls", None) or []:
+                                if call.get("name") == "propose_memory_change":
+                                    raw_args = dict(call.get("args") or {})
+                                    model_tool_calls.append({
+                                        "name": "propose_memory_change",
+                                        "args": {
+                                            key: str(raw_args.get(key) or "")[:500]
+                                            for key in (
+                                                "operation", "scope", "semantic_key", "value", "evidence"
+                                            )
+                                        },
+                                        "turn_index": turn_index,
+                                    })
+                    turn_tools = [
+                        {"tool": m.name, "content": str(m.content)[:600]}
+                        for m in new_messages if getattr(m, "type", "") == "tool"
+                    ]
+                    tool_messages.extend(turn_tools)
+                    final_answer = str(messages[-1].content) if messages else ""
+                    turn_llm_calls = int(result.get("llm_calls") or 0)
+                    total_llm_calls += turn_llm_calls
+                    turn_evidence.append({
+                        "turn_index": turn_index,
+                        "user_text": str(turn),
+                        "final_answer": final_answer,
+                        "tool_messages": turn_tools,
+                        "llm_calls": turn_llm_calls,
+                    })
+                    previous_message_count = len(messages)
+                llm_calls = total_llm_calls
             finally:
+                worker = getattr(locals().get("app"), "memory_worker", None)
+                if worker is not None:
+                    worker.stop(timeout=10.0)
                 for patcher in reversed(patches):
                     patcher.stop()
                 office_after = _hash_office(office_dir)
+                profile_after = ""
+                if os.path.exists(profile_path):
+                    with open(profile_path, encoding="utf-8") as fh:
+                        profile_after = fh.read()
 
             evidence = {
                 "trial_id": trial_id,
@@ -299,8 +422,12 @@ class TrialRunner:
                 "events": recorder.events,
                 "final_answer": final_answer,
                 "tool_messages": tool_messages,
+                "model_tool_calls": model_tool_calls,
+                "turns": turn_evidence,
                 "office_before": office_before,
                 "office_after": office_after,
+                "profile_before": profile_before,
+                "profile_after": profile_after,
                 "observed_metrics": {
                     "wall_time_seconds": round(time.time() - started, 3),
                     "llm_calls": llm_calls,
@@ -323,6 +450,55 @@ class TrialRunner:
             checks.append({"check_id": check_id, "status": status,
                            "expected": expected, "actual": str(actual)[:200]})
 
+        proposal_expectation = prog.get("memory_proposal")
+        if proposal_expectation:
+            proposals = [call for call in evidence.get("model_tool_calls", [])
+                         if call.get("name") == "propose_memory_change"]
+            should_propose = bool(proposal_expectation.get("should_propose"))
+            add("memory_proposal_presence",
+                "pass" if bool(proposals) == should_propose else "fail",
+                "proposal expected" if should_propose else "no proposal expected",
+                f"{len(proposals)} proposal(s)")
+            if should_propose and proposals:
+                expected_operation = proposal_expectation.get("operation")
+                expected_scope = proposal_expectation.get("scope")
+                current_user = str((case.get("turns") or [case["user_prompt"]])[-1])
+                matching = [
+                    proposal for proposal in proposals
+                    if (not expected_operation or (proposal.get("args") or {}).get("operation") == expected_operation)
+                    and (not expected_scope or (proposal.get("args") or {}).get("scope") == expected_scope)
+                ]
+                grounded = [
+                    proposal for proposal in matching
+                    if _grounded_memory_evidence(
+                        str((proposal.get("args") or {}).get("evidence") or ""),
+                        current_user,
+                    )
+                ] if matching else []
+                # 模型可能先发出格式错误的调用，再根据 ToolMessage 修正。
+                # 断言应检查最终可执行的提案，而不是第一条失败尝试。
+                matching = grounded or matching
+                args = (matching[0] if matching else proposals[0]).get("args") or {}
+                if expected_operation:
+                    add("memory_proposal_operation",
+                        "pass" if args.get("operation") == expected_operation else "fail",
+                        expected_operation, args.get("operation"))
+                if expected_scope:
+                    add("memory_proposal_scope",
+                        "pass" if args.get("scope") == expected_scope else "fail",
+                        expected_scope, args.get("scope"))
+                evidence_text = str(args.get("evidence") or "")
+                add("memory_proposal_evidence",
+                    "pass" if _grounded_memory_evidence(evidence_text, current_user) else "fail",
+                    "evidence is a substring of the latest user message", evidence_text)
+            writes = [event for event in evidence.get("events", [])
+                      if event.get("event") == "memory_event_appended"
+                      and event.get("event_type") == "memory_change"]
+            add("memory_commit_after_review",
+                "pass" if bool(writes) == should_propose else "fail",
+                "approved proposal is committed" if should_propose else "no memory event is committed",
+                len(writes))
+
         if "final_contains" in prog:
             for token in prog["final_contains"]:
                 add(f"final::{token[:20]}",
@@ -338,6 +514,36 @@ class TrialRunner:
                         "pass" if hit else "fail",
                         f"{tool_name} any result contains {token!r}",
                         (contents[-1] if contents else "")[:120])
+
+        if "profile_after_contains" in prog:
+            for token in prog["profile_after_contains"]:
+                add(
+                    f"profile::{token[:20]}",
+                    "pass" if token in evidence.get("profile_after", "") else "fail",
+                    f"profile contains {token!r}",
+                    evidence.get("profile_after", "")[:160],
+                )
+
+        if prog.get("profile_unchanged"):
+            add(
+                "profile_unchanged",
+                "pass" if evidence.get("profile_before") == evidence.get("profile_after") else "fail",
+                "profile remains unchanged",
+                "unchanged" if evidence.get("profile_before") == evidence.get("profile_after") else "changed",
+            )
+
+        if prog.get("context_memory_zero"):
+            context_events = [
+                event for event in evidence.get("events", [])
+                if event.get("event") == "context_compiled"
+            ]
+            leaked = [event.get("memory_records") for event in context_events if event.get("memory_records")]
+            add(
+                "context_memory_zero",
+                "pass" if not leaked else "fail",
+                "no memory records injected",
+                "none" if not leaked else leaked[-1],
+            )
 
         if "executor_calls_zero" in prog:
             for tool_name in prog["executor_calls_zero"]:

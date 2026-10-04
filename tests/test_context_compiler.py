@@ -13,6 +13,7 @@ from fluxagent.capability.context_compiler import (
     MemoryStore,
     ProfileCompatProvider,
     estimate_tokens,
+    normalize_profile_key,
 )
 
 
@@ -61,7 +62,7 @@ class TestMemoryStore(unittest.TestCase):
     def test_ttl_expiry(self):
         store = MemoryStore()
         store.add(
-            MemoryScope.TASK_STATE,
+            MemoryScope.EPISODIC,
             "临时状态",
             key="task.tmp",
             ttl_seconds=10,
@@ -76,12 +77,23 @@ class TestMemoryStore(unittest.TestCase):
 
     def test_key_supersedes_old_value(self):
         store = MemoryStore()
-        store.add(MemoryScope.USER_FACT, "家庭人数：2人", key="profile.household")
-        store.add(MemoryScope.USER_FACT, "家庭人数：4人", key="profile.household")
+        first = store.add(
+            MemoryScope.USER_FACT, "家庭人数：2人", key="profile.household", now=100.0
+        )
+        second = store.add(
+            MemoryScope.USER_FACT, "家庭人数：4人", key="profile.household", now=200.0
+        )
         records = store.query(scopes=[MemoryScope.USER_FACT])
         values = [r.value for r in records]
         self.assertIn("家庭人数：4人", values)
         self.assertNotIn("家庭人数：2人", values)
+        self.assertEqual(first.created_at, second.created_at)
+        self.assertEqual(second.updated_at, 200.0)
+
+        unchanged = store.add(
+            MemoryScope.USER_FACT, "家庭人数：4人", key="profile.household", now=300.0
+        )
+        self.assertEqual(unchanged.updated_at, 200.0)
 
     def test_capability_tag_filtering(self):
         store = MemoryStore()
@@ -106,6 +118,34 @@ class TestMemoryStore(unittest.TestCase):
             self.assertIn("家庭人数：3人", values)
             self.assertIn("饮食忌口：不吃香菜", values)
 
+    def test_profile_fields_remain_distinct_during_legacy_import(self):
+        self.assertNotEqual(normalize_profile_key("报告语言"), normalize_profile_key("报告输出语言"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "user_profile.md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("- **报告语言**：中文\n- **报告输出语言**：英文\n")
+            store = MemoryStore()
+            ProfileCompatProvider(path).load_into(store)
+            values = [
+                record.value
+                for record in store.query(scopes=[MemoryScope.USER_FACT])
+            ]
+            self.assertEqual(set(values), {"报告语言：中文", "报告输出语言：英文"})
+
+    def test_profile_migration_runs_once_and_preserves_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "user_profile.md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("- **报告语言**：中文\n- **家庭人数**：3人\n")
+            store = MemoryStore()
+            provider = ProfileCompatProvider(path)
+            provider.migrate_once(store)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("- **报告输出语言**：英文\n")
+            self.assertEqual(provider.migrate_once(store), 0)
+            self.assertEqual(len(store.all_records()), 2)
+            self.assertTrue(os.path.isfile(path + ".migrated.bak"))
+
 
 class TestMemoryStorePersistence(unittest.TestCase):
     """重启恢复：持久化往返、TTL 不复活、会话隔离保留、坏文件 fail-open。"""
@@ -116,7 +156,7 @@ class TestMemoryStorePersistence(unittest.TestCase):
             MemoryScope.USER_FACT, "家庭人数：3人", key="profile.household"
         )
         store.add(
-            MemoryScope.TASK_STATE,
+            MemoryScope.EPISODIC,
             "当前任务：分析股票行情",
             key="task.s1",
             capability_tags=("cap.market",),
@@ -138,7 +178,7 @@ class TestMemoryStorePersistence(unittest.TestCase):
             self.assertEqual(values, {"家庭人数：3人"})
             # 会话级记录按原 session 边界可见
             scoped = restored.query(
-                scopes=[MemoryScope.TASK_STATE],
+                scopes=[MemoryScope.EPISODIC],
                 capability_id="cap.market",
                 session_id="session-a",
             )
@@ -151,7 +191,7 @@ class TestMemoryStorePersistence(unittest.TestCase):
             path = os.path.join(tmp, "structured_memory.json")
             store = MemoryStore(persist_path=path)
             store.add(
-                MemoryScope.TASK_STATE,
+                MemoryScope.EPISODIC,
                 "早已过期",
                 key="task.old",
                 ttl_seconds=100,
@@ -170,14 +210,14 @@ class TestMemoryStorePersistence(unittest.TestCase):
             self._make_store(path)
             restored = MemoryStore(persist_path=path)
             restored.load(path)
-            # 全局记录任何会话可见；会话 A 的 task_state 不泄漏给会话 B，
+            # 全局记录任何会话可见；会话 A 的经验不泄漏给会话 B，
             # 无会话上下文（session_id=None）时一律排除（fail-closed）
             self.assertEqual(
                 [r.value for r in restored.query(session_id="session-b")],
                 ["家庭人数：3人"],
             )
             self.assertEqual(
-                len(restored.query(scopes=[MemoryScope.TASK_STATE], session_id="session-b")),
+                len(restored.query(scopes=[MemoryScope.EPISODIC], session_id="session-b")),
                 0,
             )
             self.assertEqual(len(restored.query(session_id=None)), 1)
@@ -210,7 +250,7 @@ class TestMemoryStorePersistence(unittest.TestCase):
             store.forget("user_fact:profile.household")
             again = MemoryStore()
             again.load(path)
-            # 全局画像记录已被删除；会话级 task_state 仍在原会话边界内
+            # 全局画像记录已被删除；会话级经验仍在原会话边界内
             self.assertEqual([r.value for r in again.query()], [])
             self.assertEqual(
                 [
@@ -253,7 +293,7 @@ class TestContextCompiler(unittest.TestCase):
         compiler = ContextCompiler(store_with_facts(), token_budget=4000)
         snapshot = compiler.compile(
             CompilationContext(
-                user_text="给我推荐今天的菜谱",
+                user_text="给我推荐今天的菜谱，注意过敏原和家庭人数，并用中文输出",
                 route="route",
                 intent="recommend_meal",
                 capability_ids=("cap.cooking",),
@@ -264,6 +304,9 @@ class TestContextCompiler(unittest.TestCase):
         self.assertIn("家庭人数：3人", values)
         self.assertIn("过敏原：对虾过敏", values)
         self.assertIn("最终报告只能用中文输出", values)
+        self.assertIn("Untrusted memory data", snapshot.system_prompt)
+        self.assertIn("record_id=user_fact:profile.household", snapshot.system_prompt)
+        self.assertIn("semantic_key=household", snapshot.system_prompt)
         reasons = {m.record_id: m.reason for m in snapshot.memory}
         self.assertIn("scope=user_fact", reasons["user_fact:profile.household"])
         self.assertNotIn("项目密码本位置：保险柜", snapshot.system_prompt)
@@ -278,7 +321,7 @@ class TestContextCompiler(unittest.TestCase):
     def test_unrelated_capability_memory_excluded(self):
         store = store_with_facts()
         store.add(
-            MemoryScope.TASK_STATE,
+            MemoryScope.EPISODIC,
             "正在分析茅台K线",
             key="task.market",
             capability_tags=("cap.market",),
@@ -290,18 +333,18 @@ class TestContextCompiler(unittest.TestCase):
                 route="route",
                 intent="recommend_meal",
                 capability_ids=("cap.cooking",),
-                memory_scopes=("task_state",),
+                memory_scopes=("episodic",),
             )
         )
         self.assertNotIn("茅台", snapshot.system_prompt)
         # 换到市场能力后出现
         snapshot2 = compiler.compile(
             CompilationContext(
-                user_text="看盘",
+                user_text="看盘和茅台K线",
                 route="route",
                 intent="quote_lookup",
                 capability_ids=("cap.market",),
-                memory_scopes=("task_state",),
+                memory_scopes=("episodic",),
             )
         )
         self.assertIn("茅台", snapshot2.system_prompt)

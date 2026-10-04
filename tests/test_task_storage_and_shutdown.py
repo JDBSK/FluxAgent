@@ -51,12 +51,11 @@ class AtomicTaskTests(unittest.TestCase):
                 self.assertIn("设定失败", result)
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), [{"id": "original"}])
 
-    def test_read_profile_is_registered(self):
-        self.assertIn("read_user_profile", [tool.name for tool in builtins.BUILTIN_TOOLS])
-        profile = self.path.parent / "profile.md"
-        profile.write_text("profile", encoding="utf-8")
-        with patch.object(builtins, "PROFILE_PATH", str(profile)):
-            self.assertEqual(builtins.read_user_profile.invoke({}), "profile")
+    def test_legacy_profile_tools_are_not_registered(self):
+        names = [tool.name for tool in builtins.BUILTIN_TOOLS]
+        self.assertNotIn("read_user_profile", names)
+        self.assertNotIn("save_user_profile", names)
+        self.assertIn("propose_memory_change", names)
 
 
 class HeartbeatTests(unittest.IsolatedAsyncioTestCase):

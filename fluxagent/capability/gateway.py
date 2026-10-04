@@ -170,6 +170,8 @@ class ExecutionGateway:
     # ---------- 校验 ----------
 
     def validate(self, tool_name: str, args: Optional[Mapping[str, Any]]) -> GatewayResult:
+        """参数网关：在执行前检查契约、注册表、能力健康、熔断状态和 JSON Schema。
+        返回 GatewayResult，status=SUCCESS 表示可以执行；否则禁止执行。"""
         args = dict(args or {})
         if self.contract.is_expired():
             return GatewayResult(
@@ -225,6 +227,7 @@ class ExecutionGateway:
                 f"参数未通过 JSON Schema 校验: {schema_error}。"
                 "本回合禁止换参数重试同一工具。",
             )
+        
         return GatewayResult(
             ToolCallStatus.SUCCESS,
             tool_name,

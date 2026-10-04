@@ -43,7 +43,7 @@ Provider 发现 -> Capability Registry（全量登记，不给模型）
 | `providers.py` | 三来源适配 | builtin_descriptors / mcp_descriptors / skill_descriptors / descriptors_from_tools（metadata fallback，复刻 `mcp_<server>_` 命名降级规则）；暴露名清理与 `mcp.client._exposed_name` 一致；bind_operation_tools 绑定执行工具 |
 | `retrieval.py` | 检索底层 | 纯 Python Okapi BM25（JSON 持久化）；EmbeddingProvider 接口（DeterministicHashEmbedding 离线默认 / OpenAICompatibleEmbedding 可配置）；DenseIndex 余弦检索；RRF 融合（只用户次，不相加异构分数） |
 | `router.py` | 能力级路由 | 显式别名解析（最长命中，并列→clarify）> Hybrid（BM25+dense→RRF→HeuristicReranker）；准入=证据覆盖−反例惩罚−健康惩罚−缺槽位惩罚，无单一"置信度"裁决；输出不可变 RouteDecision，契约含 retry_policy（schema_error/route_mismatch/approval_rejected→stop） |
-| `context_compiler.py` | 选择性记忆与编译 | MemoryRecord（scope/user_fact、user_preference、task_state、episodic、skill_context；TTL/敏感级/来源/置信度）；ProfileCompatProvider 把既有 Markdown 画像导入为结构化记录（核心不依赖 Markdown）；ContextSnapshot 按优先级（规则>契约>相关事实>任务态>失败事实>skill 片段>摘要）+ token 预算（CJK≈1 token/字，其他 4 字符/token）裁剪；注入内容全部带 record_id 与原因 |
+| `memory_store.py` + `context_compiler.py` | 选择性记忆与编译 | `memory_store.py` 负责 MemoryRecord、存储过滤和 ProfileCompatProvider；`context_compiler.py` 只负责 ContextSnapshot，按优先级（规则>契约>相关事实>工具经验>skill 片段>摘要）+ token 预算（CJK≈1 token/字，其他 4 字符/token）裁剪；注入内容全部带 record_id 与原因 |
 | `gateway.py` | 执行边界 | 校验链：契约成员→快照版本→能力健康→熔断→真实 JSON Schema；越权=route_mismatch（不进审批不执行）；统一错误协议 10 态 + envelope（retryable/retry_policy 字段）；CircuitBreaker closed→open→half_open（单探测、成功复位、失败重开、按 capability 隔离） |
 
 ## 4. Agent 集成改动（fluxagent/core/agent.py）
@@ -70,7 +70,7 @@ Provider 发现 -> Capability Registry（全量登记，不给模型）
 - embedding 未配置时使用确定性本地向量（索引 tag 明确标注），不伪装成语义模型；接入远程 embedding 只需配置，不改路由代码。
 - Reranker 双模式：无语义第二路（确定性向量）时按检索器原始名次排序（覆盖度/惩罚只做过滤）；接入真实 embedding 时切换 blended 模式（0.7 覆盖 + 0.3 RRF 归一化）。另支持 LLMReranker（受约束单选 JSON，设置 FLUXAGENT_ROUTER_MODEL 启用，故障回退启发式并审计）。
 - 索引持久化：workspace/memory/capability_index 下按 registry 版本 + embedding tag 双匹配复用，不匹配即重建，杜绝旧索引配新注册表。
-- 记忆写侧：agent_node 每回合写 task_state（TTL 1h，带能力标签）；tools_node 将工具失败写入 episodic（TTL 24h）。带能力标签的记录在 abstain 回合一律排除（防跨任务泄漏，指标回归覆盖）。
+- 记忆写侧：只在用户明确更新画像或工具真实返回成功/失败后写入事件；工具经验默认 TTL 24h。当前任务状态只在 checkpoint，不写入长期记忆。带能力标签的记录在 abstain 回合一律排除（防跨任务泄漏，指标回归覆盖）。
 - 已知限制：无真实 embedding 服务时语义检索退化为词法（当前渠道不提供 embedding 模型，已用服务错误实证）；槽位缺失检查是保守包含性匹配，最终以 Gateway 的 JSON Schema 校验为准。
 
 ## 7. 测试
@@ -106,8 +106,8 @@ EVALUATION_MD = """# 统一能力路由定向测评总结
 ## 2. 记忆选择指标（9 条标注记录 / 3 个查询视角）
 
 - **precision={mem_p}，recall={mem_r}，F1={mem_f1}**
-- 语义规则由指标驱动定案：无标签记录（通用事实/通用经验）跨能力可见；带能力标签的记录只进对应能力，**abstain 回合一律排除**（修复了一个真实跨任务泄漏：abstain 时其他能力的 task_state 被注入）；敏感记录与 TTL 过期记录在全部视角下被排除。
-- 隔离用例：菜谱视角不含茅台/股票工具失败史；市场视角含行情任务态与该能力的失败经验；通用问答不携带任何能力任务态。
+- 语义规则由指标驱动定案：无标签记录（通用事实/通用经验）跨能力可见；带能力标签的记录只进对应能力，**abstain 回合一律排除**；敏感记录与 TTL 过期记录在全部视角下被排除。
+- 隔离用例：菜谱视角不含茅台/股票工具失败史；市场视角含行情工具失败经验；通用问答不携带任何能力专属经验。
 
 ## 3. 端到端行为（真实模型 glm-5 / {provider}）
 
@@ -124,7 +124,7 @@ EVALUATION_MD = """# 统一能力路由定向测评总结
 {scale_rows}
 
 **长会话记忆回归**（60 轮、每 5 轮切域、同域保留路径覆盖、历史膨胀施压）：
-四个高发失效模式全部零违规——F1 跨域任务态/episodic 泄漏、F2 任务态堆积（同 key 覆盖，库内恒 1 条）、F3 token 预算失守（峰值 {ls_max}/2200，规则与契约段存活）、F4 敏感/过期复活。记忆库有界：task 1 条 + episodic 6 条（TTL 约束）。
+四个高发失效模式全部零违规——F1 跨域经验泄漏、F2 稳定 key 经验堆积（同 key 覆盖）、F3 token 预算失守（峰值 {ls_max}/2200，规则与契约段存活）、F4 敏感/过期复活。记忆库有界：稳定 key 经验 1 条 + episodic 6 条（TTL 约束）。
 
 **数据边界（本项验证后修复/确认）**：
 - 修复：跨会话泄漏（session 归属 + fail-closed 查询/写入命名空间）、builtin 混入路由索引导致"查行情→list_scheduled_tasks"的真实部署级错配（INDEX_FORMAT_VERSION 失效机制随之建立）；

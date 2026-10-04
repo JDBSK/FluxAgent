@@ -25,7 +25,7 @@ def runtime_cases() -> list[dict[str, Any]]:
         "list_scheduled_tasks": ("read", False),
         "get_system_model_info": ("read", False),
         "write_office_file": ("write", False),
-        "save_user_profile": ("mutate", False),
+        "propose_memory_change": ("mutate", False),
         "schedule_task": ("mutate", False),
         "delete_scheduled_task": ("mutate", False),
         "modify_scheduled_task": ("mutate", False),
@@ -39,7 +39,7 @@ def runtime_cases() -> list[dict[str, Any]]:
             args = {"sub_dir": ""}
         if tool == "read_office_file":
             args = {"filepath": "a.txt"}
-        if tool == "save_user_profile":
+        if tool == "propose_memory_change":
             args = {"content": "likes tea"}
         if tool.startswith("schedule") or "scheduled_task" in tool:
             args = {"task_id": "t1"}
@@ -323,7 +323,7 @@ def runtime_cases() -> list[dict[str, Any]]:
     cases.append({"id": "replan_val_filter", "kind": "replan_validate", "steps": ["write evil", "read file", "finish"], "forbidden": "write evil", "expect_ok": True, "expect_len": 2})
     cases.append({"id": "replan_val_all_bad", "kind": "replan_validate", "steps": ["write evil", "write evil"], "forbidden": "write evil", "expect_ok": False, "expect_len": 0})
     cases.append({"id": "replan_val_short", "kind": "replan_validate", "steps": ["only one"], "forbidden": "", "expect_ok": False, "expect_len": 1})
-    for tool in ["write_office_file", "execute_office_shell", "save_user_profile", "schedule_task", "delete_scheduled_task", "modify_scheduled_task"]:
+    for tool in ["write_office_file", "execute_office_shell", "propose_memory_change", "schedule_task", "delete_scheduled_task", "modify_scheduled_task"]:
         cases.append({"id": f"side_align_danger_{tool}", "kind": "side_effect_align", "tool": tool, "expect_side": True})
     for tool in ["get_current_time", "calculator", "list_office_files", "read_office_file", "list_scheduled_tasks", "get_system_model_info"]:
         cases.append({"id": f"side_align_safe_{tool}", "kind": "side_effect_align", "tool": tool, "expect_side": False})

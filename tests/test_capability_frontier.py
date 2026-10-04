@@ -326,7 +326,7 @@ class TestSessionBoundaryConcurrency(unittest.TestCase):
             try:
                 for turn in range(times):
                     store.add(
-                        MemoryScope.TASK_STATE,
+                        MemoryScope.EPISODIC,
                         f"任务：处理{domain}数据{turn}",
                         key=f"task:{session_id}",
                         capability_tags=(f"mcp.{domain}",),
@@ -338,7 +338,7 @@ class TestSessionBoundaryConcurrency(unittest.TestCase):
                             route="route",
                             intent=f"{domain}_intent",
                             capability_ids=(f"mcp.{domain}",),
-                            memory_scopes=("task_state",),
+                            memory_scopes=("episodic",),
                             session_id=session_id,
                         )
                     )

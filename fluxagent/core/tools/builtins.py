@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""内置工具集：时间查询、安全计算、用户画像管理、任务调度、沙盒文件与 Shell。
+"""内置工具集：时间查询、安全计算、记忆提案、任务调度、沙盒文件与 Shell。
 
 所有工具用 @fluxagent_tool 装饰器注册，BUILTIN_TOOLS 列表汇总后传入 ToolNode。
 任务调度相关工具用 threading.Lock 保护 tasks.json 的并发读写。
@@ -12,7 +12,7 @@ import json
 import uuid
 import threading
 from typing import Optional
-from ..config import MEMORY_DIR, TASKS_FILE
+from ..config import TASKS_FILE
 from ..installer import (
     InstallError,
     install_mcp_source,
@@ -30,7 +30,6 @@ from .sandbox_tools import (
 
 
 tasks_lock = threading.Lock()
-PROFILE_PATH = os.path.join(MEMORY_DIR, "user_profile.md")
 
 # 定时任务循环频率白名单；repeat_count 提供 repeat 才有意义
 _VALID_REPEATS = frozenset({"hourly", "daily", "weekly", "monthly"})
@@ -52,37 +51,19 @@ def get_system_model_info() -> str:
 
 
 @fluxagent_tool
-def save_user_profile(new_content: str) -> str:
-    """
-    更新用户的全局显性记忆档案。
-    当你发现用户的偏好发生改变，或者有新的重要事实需要记录时：
-    1.请先调用 read_user_profile 获取当前的完整档案。
-    2.在你的上下文中，将新信息融入档案，并删去冲突或过时的旧信息。
-    3.将修改后的一整篇完整 Markdown 文本作为 new_content 参数传入此工具。
-    注意：此操作将完全覆盖旧文件！请确保传入的是完整的最新档案。
-    """
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    with open(PROFILE_PATH, "w", encoding="utf-8") as f:
-        f.write(new_content)
+def propose_memory_change(
+    operation: str,
+    scope: str,
+    semantic_key: str,
+    value: str,
+    evidence: str,
+) -> str:
+    """提出一条长期记忆变更；校验通过并经用户审批后才会保存。
 
-    return "记忆档案已成功覆写更新。新的人设画像已生效。"
-
-
-@fluxagent_tool
-def read_user_profile() -> str:
+    调用本工具就是提交提案，不要先用文字询问用户是否要记住；工具调用
+    暂停后由人工审批完成确认。一次性要求不应调用本工具。
     """
-    读取用户的全局显性记忆档案（user_profile.md）。
-    在回答个性化问题、或准备调用 save_user_profile 修改档案之前，先调用此工具
-    获取当前完整档案，避免凭记忆猜测或误覆盖用户的长期偏好。
-    """
-    if not os.path.exists(PROFILE_PATH):
-        return "（用户档案暂无记录）"
-    try:
-        with open(PROFILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read().strip()
-        return content or "（用户档案暂无记录）"
-    except OSError as e:
-        return f"读取档案失败：{e}"
+    return "记忆变更提案已提交，等待校验和用户审批。"
 
 
 @fluxagent_tool
@@ -418,13 +399,12 @@ BUILTIN_TOOLS = [
     install_skill,
     install_mcp_server,
     list_installed_mcp_servers,
-    read_user_profile,
-    save_user_profile,
     list_office_files,
     read_office_file,
     write_office_file,
     execute_office_shell,
     get_system_model_info,
+    propose_memory_change,
     schedule_task,
     list_scheduled_tasks,
     delete_scheduled_task,

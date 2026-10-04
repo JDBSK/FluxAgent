@@ -31,7 +31,7 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 TRIALS_PATH = os.path.join(REPORT_DIR, "llmjudge_trials.jsonl")
 
 
-def _persist(result: dict) -> None:
+def _persist(result: dict, trials_path: str = TRIALS_PATH) -> None:
     """每个 trial 完成立即落盘（含完整证据）：断点续跑与事后复评的基础。"""
     record = {
         "case_id": result["case"]["case_id"],
@@ -42,15 +42,16 @@ def _persist(result: dict) -> None:
         "verdict": result["verdict"],
         "evidence": result["evidence"],
     }
-    with open(TRIALS_PATH, "a", encoding="utf-8") as fh:
+    os.makedirs(os.path.dirname(trials_path), exist_ok=True)
+    with open(trials_path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, default=str) + chr(10))
 
 
-def _load_trials() -> list[dict]:
-    if not os.path.exists(TRIALS_PATH):
+def _load_trials(trials_path: str = TRIALS_PATH) -> list[dict]:
+    if not os.path.exists(trials_path):
         return []
     records = []
-    with open(TRIALS_PATH, encoding="utf-8") as fh:
+    with open(trials_path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if line:
@@ -73,12 +74,13 @@ def _run_one(runner: TrialRunner, case: dict, trial_index: int, stub: bool,
 
 
 def _run_all(cases: list[dict], runner: TrialRunner, stub: bool, repeat: int,
-             judge_provider=None, workers: int = 1, resume: bool = False) -> list[dict]:
+             judge_provider=None, workers: int = 1, resume: bool = False,
+             trials_path: str = TRIALS_PATH) -> list[dict]:
     results: list[dict] = []
     done_ids: set[str] = set()
     if resume:
         # 只续跑同模式（stub/real）的记录：stub 试跑记录不会污染真实批次
-        for record in _load_trials():
+        for record in _load_trials(trials_path):
             if bool(record.get("stub")) != stub:
                 continue
             results.append(_result_from_record(record))
@@ -100,7 +102,7 @@ def _run_all(cases: list[dict], runner: TrialRunner, stub: bool, repeat: int,
             while True:
                 try:
                     item = _run_one(runner, case, idx, stub, judge_provider)
-                    _persist(item)
+                    _persist(item, trials_path)
                     batch_results.append(item)
                     break
                 except Exception as exc:
@@ -269,11 +271,13 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="替身模型试跑（0 API 成本）")
     parser.add_argument("--real", action="store_true", help="真实模型运行 SUT + judge")
     parser.add_argument("--calibration", action="store_true", help="跑裁判校准集（需 API）")
-    parser.add_argument("--track", choices=["capability", "contract", "frontier"])
-    parser.add_argument("--family", help="只跑指定场景族 A-L")
+    parser.add_argument("--track", choices=["capability", "contract", "frontier", "memory"])
+    parser.add_argument("--family", help="只跑指定场景族 A-M；M 为长期记忆提案")
     parser.add_argument("--case", help="只跑指定 case_id")
     parser.add_argument("--repeat", type=int, default=1, help="每用例 trial 次数")
     parser.add_argument("--workers", type=int, default=1, help="并发 worker 数（默认串行）")
+    parser.add_argument("--run-id", help="独立评测批次 ID，写入 trial 主键")
+    parser.add_argument("--output-dir", help="独立评测输出目录，默认 logs")
     parser.add_argument("--resume", action="store_true", help="跳过 llmjudge_trials.jsonl 中已完成的 trial")
     parser.add_argument("--rejudge", action="store_true", help="对已持久化但 judge 失败/未决的 trial 仅复评（不重跑 SUT）")
     parser.add_argument("--ab", action="store_true", help="AB 换序对照（需 --real）")
@@ -286,7 +290,10 @@ def main() -> int:
     if not (args.dry_run or args.real or args.calibration):
         args.dry_run = True
 
-    os.makedirs(REPORT_DIR, exist_ok=True)
+    run_id = str(args.run_id or time.strftime("run-%Y%m%d-%H%M%S"))
+    output_dir = os.path.abspath(args.output_dir or REPORT_DIR)
+    os.makedirs(output_dir, exist_ok=True)
+    trials_path = os.path.join(output_dir, "trials.jsonl")
     judge_provider = None
     key_pool = None
     pool_base_url = pool_model = None
@@ -310,7 +317,7 @@ def main() -> int:
 
     # --rejudge：只对证据已持久化、但 judge 失败/未决的 trial 复评（SUT 不重跑）
     if args.rejudge:
-        records = _load_trials()
+        records = _load_trials(trials_path)
         targets = [r for r in records
                    if r.get("verdict", {}).get("overall_verdict") == "inconclusive"
                    and (r.get("evidence") or {}).get("final_answer") is not None
@@ -326,10 +333,10 @@ def main() -> int:
             new_verdict = _rj(case, record["evidence"], judge_provider)
             new_verdict["judge_model"] = _judge_meta()
             record["verdict"] = new_verdict
-            with open(TRIALS_PATH, "a", encoding="utf-8") as fh:
+            with open(trials_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False, default=str) + chr(10))
             print(f"  rejudge {record['case_id']} -> {new_verdict['overall_verdict']}", file=sys.stderr)
-        records = _load_trials()
+        records = _load_trials(trials_path)
         # 每个 trial 取最后一条记录（同 trial_id 可能被复评多次）
         latest: dict[str, dict] = {}
         for record in records:
@@ -341,8 +348,8 @@ def main() -> int:
                 r["case"].setdefault("judge_only", {})
         summary = aggregate(results)
         config_note = f"mode=rejudge judge={_judge_meta()}"
-        out_json = os.path.join(REPORT_DIR, "llmjudge_report.json")
-        out_md = os.path.join(REPORT_DIR, "llmjudge_report.md")
+        out_json = os.path.join(output_dir, "report.json")
+        out_md = os.path.join(output_dir, "report.md")
         with open(out_json, "w", encoding="utf-8") as fh:
             json.dump({"summary": summary, "config": config_note,
                        "results": [{"case_id": r["case"]["case_id"],
@@ -377,21 +384,24 @@ def main() -> int:
     if not cases:
         print("没有匹配的用例", file=sys.stderr)
         return 2
-    runner = TrialRunner(key_pool=key_pool, base_url=pool_base_url, sut_model=pool_model)
+    runner = TrialRunner(key_pool=key_pool, base_url=pool_base_url, sut_model=pool_model,
+                         run_id=run_id)
     started = time.time()
     results = _run_all(cases, runner, stub=args.dry_run and not args.real,
                        repeat=args.repeat, judge_provider=judge_provider,
-                       workers=args.workers, resume=args.resume)
+                       workers=args.workers, resume=args.resume,
+                       trials_path=trials_path)
 
     summary = aggregate(results)
     config_note = (
+        f"run_id={run_id} output_dir={output_dir} "
         f"mode={'stub dry-run' if args.dry_run and not args.real else 'real'} "
         f"repeat={args.repeat} workers={args.workers} "
         f"judge={_judge_meta() if judge_provider else 'programmatic-only'}"
     )
     report_md = render_markdown(summary, results, config_note)
-    out_json = os.path.join(REPORT_DIR, "llmjudge_report.json")
-    out_md = os.path.join(REPORT_DIR, "llmjudge_report.md")
+    out_json = os.path.join(output_dir, "report.json")
+    out_md = os.path.join(output_dir, "report.md")
     with open(out_json, "w", encoding="utf-8") as fh:
         json.dump({"summary": summary, "config": config_note, "wall_seconds": round(time.time() - started, 1),
                    "results": [

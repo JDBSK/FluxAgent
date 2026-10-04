@@ -24,6 +24,9 @@ workspace/
 # Local candidate / scratch documents
 README.open-source-candidate.md
 
+# Personal learning notes; keep them local.
+learning/
+
 # Public docs directory contains images only; keep Markdown/HTML notes local.
 docs/**
 !docs/**/*.png

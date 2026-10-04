@@ -171,7 +171,7 @@ class TestSelectiveMemoryInjection(unittest.TestCase):
                 enable_planner=False,
                 require_approval=False,
             )
-            app.invoke({"messages": [HumanMessage(content="今天天气不错")]})
+            app.invoke({"messages": [HumanMessage(content="按我的家庭人数和过敏原推荐今天的菜谱")]})
         prompt = str(llm.invoke.call_args.args[0][0].content)
         self.assertIn("家庭人数", prompt)  # user_fact 常驻相关记忆
         self.assertIn("[Invocation contract]", prompt)

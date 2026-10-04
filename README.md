@@ -38,7 +38,7 @@
 - 🔄 **任务规划与执行**：简单请求直接回答，复杂请求进入 Planner → Agent → Tool → Progress流程。
 - ♻️ **失败处理**：区分瞬时错误、文件或参数错误、策略错误，分别处理 retry、replan 和终止。
 - 🛡️ **执行前确认**：写操作工具进入 Human-in-the-loop（HITL），高风险参数由 Policy 直接拦截。
-- **🧠 持续学习**：双水位记忆系统（长期画像 + 短期摘要），越用越懂用户。
+- **🧠 选择性记忆**：工作记忆、短期上下文和长期记忆分层；真实事件先落 SQLite，再检索相关内容，避免把全部画像塞给模型。
 - 💾 **状态可恢复**：使用 AsyncSqliteSaver保存图状态，多会话通过thread_id进行**会话隔离**。
 - 🧩 **Skill 与 MCP 扩展**：支持 Github开源工具SKILL和 MCP 安装与懒加载，两段式调用（help → run），先看说明书再执行。
 - 💻 **运行时监控**：JSONL 审计日志记录 LLM 输入、工具调用、工具结果、AI 回复和系统动作。
@@ -320,7 +320,7 @@ FluxAgent 当前内置 15 个工具，覆盖时间、计算、画像、文件、
 | `get_current_time` | 获取当前时间 | “现在是几点？” |
 | `calculator` | 安全数学计算 | “计算 (128 + 64) / 4” |
 | `get_system_model_info` | 查看 Provider 和模型 | “当前使用什么模型？” |
-| `save_user_profile` | 更新用户画像 | “记住我偏好简洁回答” |
+| `propose_memory_change` | 提交单条长期记忆变更提案，需审批 | “记住我偏好简洁回答” |
 | `list_office_files` | 列出 office 文件 | “查看 demo 目录” |
 | `read_office_file` | 读取 office 文件 | “读取 project_brief.md” |
 | `write_office_file` | 写入 office 文件 | “生成 release_report.md” |
@@ -391,8 +391,15 @@ FluxAgent 将记忆和运行状态分层保存：
 | **数据** | **存储位置** | **用途** |
 |---|---|---|
 | **任务状态与对话摘要** | `SQLite checkpoint` | **断点恢复、任务计划、运行计数、历史摘要** |
-| **用户个性画像** | `workspace/memory/user_profile.md` | **跨会话保留用户的稳定偏好** |
+| **长期记忆查询快照** | `workspace/memory/structured_memory.json` | **由记忆事件投影生成，跨会话提供稳定偏好和事实** |
+| **记忆事件与投影任务** | `workspace/memory/memory_events.sqlite3` | **追加、重试、幂等投影和重放** |
 | **会话信息** | `workspace/sessions/` | **会话列表、标题、笔记和元数据** |
+
+长期记忆进入模型前经过会话/能力边界过滤、BM25 检索和 Token 限制；配置 embedding 且关键词命中不足时增加向量检索，失败自动回退 BM25。
+
+旧 `user_profile.md` 只作为一次性迁移输入并保留备份，不再是正常运行时的长期记忆主存储。
+
+当前没有让 LLM 直接整理或修改长期记忆：`MemoryWorker` 只处理已验证事件的程序投影；存储和画像解析在 `fluxagent/capability/memory_store.py`，Prompt 拼装在 `context_compiler.py`。
 
 ### **✂️上下文裁剪**
 

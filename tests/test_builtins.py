@@ -61,25 +61,23 @@ class TestBuiltInTools(unittest.TestCase):
                 result = calculator.invoke({"expression": expr})
                 self.assertIn("计算出错", result)
 
-    @patch('fluxagent.core.tools.builtins.MEMORY_DIR', new_callable=lambda: tempfile.mkdtemp())
-    @patch('fluxagent.core.tools.builtins.PROFILE_PATH', new_callable=lambda: tempfile.mktemp())
-    def test_save_user_profile(self, mock_profile_path, mock_memory_dir):
-        """测试保存用户档案功能"""
-        from fluxagent.core.tools.builtins import save_user_profile
+    def test_memory_proposal_tool_is_registered_without_writing_profile(self):
+        """长期记忆只能通过提案进入审批和事件流程。"""
+        from fluxagent.core.tools.builtins import BUILTIN_TOOLS, propose_memory_change
 
-        import tempfile
-        import os
-
-        # 测试保存功能
-        test_content = "# 用户档案\n- 姓名：张三\n- 职业：工程师"
-        result = save_user_profile.invoke({"new_content": test_content})
-        self.assertEqual(result, "记忆档案已成功覆写更新。新的人设画像已生效。")
-
-        # 验证文件已创建并包含正确内容
-        self.assertTrue(os.path.exists(mock_profile_path))
-        with open(mock_profile_path, 'r', encoding='utf-8') as f:
-            saved_content = f.read()
-        self.assertEqual(saved_content, test_content)
+        self.assertIn(propose_memory_change, BUILTIN_TOOLS)
+        self.assertEqual(
+            propose_memory_change.invoke({
+                "operation": "add",
+                "scope": "user_preference",
+                "semantic_key": "report.language",
+                "value": "中文",
+                "evidence": "以后报告用中文",
+            }),
+            "记忆变更提案已提交，等待校验和用户审批。",
+        )
+        self.assertNotIn("save_user_profile", {tool.name for tool in BUILTIN_TOOLS})
+        self.assertNotIn("read_user_profile", {tool.name for tool in BUILTIN_TOOLS})
 
 
 class TestScheduledTasks(unittest.TestCase):

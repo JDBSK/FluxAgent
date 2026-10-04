@@ -51,7 +51,7 @@ LEVEL_NAME = {
 SIDE_EFFECT_TOOLS = {
     "write_office_file",
     "execute_office_shell",
-    "save_user_profile",
+    "propose_memory_change",
     "schedule_task",
     "delete_scheduled_task",
     "modify_scheduled_task",
@@ -76,9 +76,8 @@ TOOL_BASE_LEVEL: dict[str, RiskLevel] = {
     # 委派是编排/分析类动作：子 Agent 默认只读，委派本身不产生副作用。
     # 子 Agent 作用域内的具体工具调用另由 subagents 的策略闸门单独评估。
     "delegate_task": RiskLevel.READ,
-    "read_user_profile": RiskLevel.READ,
+    "propose_memory_change": RiskLevel.MUTATE,
     "write_office_file": RiskLevel.WRITE,
-    "save_user_profile": RiskLevel.MUTATE,
     "schedule_task": RiskLevel.MUTATE,
     "delete_scheduled_task": RiskLevel.MUTATE,
     "modify_scheduled_task": RiskLevel.MUTATE,
@@ -114,7 +113,6 @@ class PolicyConfig:
 
     gate_level: RiskLevel = RiskLevel.WRITE
     hard_deny_critical: bool = True
-    # 旧 approval_tools 语义：非空时「只准这批工具进审批」，替换而非追加。
     legacy_gate_tools: Optional[frozenset[str]] = None
     tool_base_overrides: dict[str, RiskLevel] = field(default_factory=dict)
 
@@ -382,9 +380,6 @@ def assess_call(
         if path_reasons:
             reasons.extend(path_reasons)
             level = RiskLevel.CRITICAL
-    elif name == "save_user_profile":
-        reasons.append("long_term_memory_mutate")
-        level = max(level, RiskLevel.MUTATE)
     elif name in {"install_skill", "install_mcp_server"}:
         install_level, install_reasons = _installer_signals(args)
         reasons.extend(install_reasons)
@@ -410,7 +405,8 @@ def assess_tool_calls(
     approved_tools: Optional[set[str]] = None,  # 已授权工具集合
     approval_checker: Optional[ApprovalChecker] = None,  # 审批检查器
 ) -> PolicyDecision:
-    """汇总一批调用。
+    """汇总工具调用，检查风险和审批需求。
+    判断风险、写操作、人工审批、路径穿越、危险命令、网络请求等信号，返回策略决策。
 
     审批门：
     - hard_deny 优先：不审批、不执行
@@ -447,11 +443,11 @@ def assess_tool_calls(
             needs_approval=False,
             hard_deny=False,
             reasons=("empty_tool_calls",),
-        )
+        )# 如果没有评估结果，则返回默认的策略决策
 
-    max_level = max(a.level for a in assessments)
-    hard_deny = any(a.hard_deny for a in assessments)
-    reasons: list[str] = []
+    max_level = max(a.level for a in assessments)  # 计算最高风险等级
+    hard_deny = any(a.hard_deny for a in assessments)  # 是否有硬拒绝的调用
+    reasons: list[str] = []  # 原因列表
     for a in assessments:
         reasons.extend(f"{a.name}:{r}" for r in a.reasons)
 
@@ -471,22 +467,19 @@ def assess_tool_calls(
             return False
 
     needs_approval = False
+    # 硬拒绝时跳过审批
     if hard_deny:
-        # 硬拒绝时跳过审批
         reasons.append("skip_approval_due_to_hard_deny")
+    # 进入审批环节
     elif require_approval:
-        # 审批门逻辑：
         if cfg.legacy_gate_tools is not None:
             pending = [
-                assessment
-                for assessment in assessments
-                if assessment.name in cfg.legacy_gate_tools
+                assessment for assessment in assessments if assessment.name in cfg.legacy_gate_tools
                 and not is_approved(assessment)
             ]
             needs_approval = bool(pending)
             if pending:
-                reasons.append("legacy_gate:" +
-                               ",".join(a.name for a in pending))
+                reasons.append("legacy_gate:" + ",".join(a.name for a in pending))
             elif any(a.name in cfg.legacy_gate_tools for a in assessments):
                 reasons.append("approved_call_grant")
         elif max_level >= cfg.gate_level:
@@ -501,8 +494,7 @@ def assess_tool_calls(
                 reasons.append("approved_call_grant")
 
     if approval_errors:
-        reasons.append("approval_checker_error:" +
-                       ",".join(approval_errors[:3]))
+        reasons.append("approval_checker_error:" + ",".join(approval_errors[:3]))
 
     return PolicyDecision(
         assessments=assessments,
