@@ -63,3 +63,14 @@ _tmp_*.py
 
 # local scratch (moved debug scripts, never tracked)
 scratch/
+
+# Internal evaluation material kept locally, not part of the public project
+/CAPABILITY_ROUTING_EVALUATION.md
+/CAPABILITY_ROUTING_IMPLEMENTATION.md
+/PROJECT_SUMMARY.md
+/CHANGELOG.md
+/run_overnight.cmd
+/fluxagent/experiments/
+/tests/eval/
+/tests/test_subagent_parallel_benchmark.py
+/examples/benchmark_lazy_loading.py

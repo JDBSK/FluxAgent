@@ -4,7 +4,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from fluxagent.core.plan_router import classify_plan, plan_fast_path, planning_request
-from tests.eval.stub import make_tool
+from tests.support.stub import make_tool
 
 
 class StubClassifier:

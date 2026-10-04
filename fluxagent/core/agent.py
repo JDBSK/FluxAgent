@@ -273,7 +273,7 @@ def _needs_plan(text: str) -> bool:
     """规则快筛的保守结果：只有明确复杂才是 True，模糊一律 False。
 
     混合路由（规则快筛 + 小模型）在 route_entry 之前完成，见 _resolve_entry_plan。
-    保留本函数是为了让既有评测入口 tests/eval/runners.py 直接测规则层。
+    保留本函数，方便在不启动完整 Agent 图的情况下测试规则层。
     """
     return plan_fast_path(text) is True
 

@@ -12,7 +12,7 @@ from fluxagent.core.agent import create_agent_app
 from fluxagent.core.approval import aapprove, apending_approval, areject
 from fluxagent.core.permission_broker import PermissionBroker
 from fluxagent.core.tools import sandbox_tools
-from tests.eval.stub import ScriptedLLM
+from tests.support.stub import ScriptedLLM
 
 
 class TestAgentCheckpointIntegration(unittest.IsolatedAsyncioTestCase):

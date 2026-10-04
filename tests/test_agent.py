@@ -23,7 +23,7 @@ class TestAgent(unittest.TestCase):
     @patch('fluxagent.core.agent.get_provider')
     def test_simple_request_skips_planner_in_real_graph(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM
+        from tests.support.stub import ScriptedLLM
         llm = ScriptedLLM(script=["直接回答"])
         mock_get_provider.return_value = llm
         app = create_agent_app(
@@ -43,7 +43,7 @@ class TestAgent(unittest.TestCase):
     def test_unverified_action_claim_forces_structured_tool_call(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
         from fluxagent.core.budget import RunBudget
-        from tests.eval.stub import ScriptedLLM, counting_tool
+        from tests.support.stub import ScriptedLLM, counting_tool
 
         calls = {"write_office_file": 0}
         tool = counting_tool("write_office_file", calls)
@@ -74,7 +74,7 @@ class TestAgent(unittest.TestCase):
     def test_repeated_plain_text_after_unverified_claim_cannot_finish(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
         from fluxagent.core.budget import RunBudget
-        from tests.eval.stub import ScriptedLLM
+        from tests.support.stub import ScriptedLLM
 
         llm = ScriptedLLM(
             script=[
@@ -98,7 +98,7 @@ class TestAgent(unittest.TestCase):
     @patch('fluxagent.core.agent.get_provider')
     def test_planned_text_steps_do_not_end_with_an_incomplete_plan(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM
+        from tests.support.stub import ScriptedLLM
 
         llm = ScriptedLLM(
             script=[
@@ -127,7 +127,7 @@ class TestAgent(unittest.TestCase):
     def test_planned_tool_step_gets_final_text_response(self, mock_get_provider):
         """A successful final tool step must not terminate before synthesis."""
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM, counting_tool
+        from tests.support.stub import ScriptedLLM, counting_tool
 
         tool = counting_tool("demo_skill", {}, result="说明书内容")
         llm = ScriptedLLM(
@@ -154,7 +154,7 @@ class TestAgent(unittest.TestCase):
     @patch('fluxagent.core.agent.get_provider')
     def test_install_step_does_not_terminate_following_plan_steps(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM, counting_tool
+        from tests.support.stub import ScriptedLLM, counting_tool
 
         calls = {}
         installer = counting_tool(
@@ -186,7 +186,7 @@ class TestAgent(unittest.TestCase):
     @patch('fluxagent.core.agent.get_provider')
     def test_successful_unplanned_skill_gets_final_synthesis(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM, counting_tool
+        from tests.support.stub import ScriptedLLM, counting_tool
 
         skill = counting_tool("persona_skill", {}, result="技能说明内容")
         llm = ScriptedLLM(
@@ -210,7 +210,7 @@ class TestAgent(unittest.TestCase):
 
     def test_explicit_backend_name_scopes_model_tools(self):
         from fluxagent.core.agent import _explicit_tool_scope
-        from tests.eval.stub import make_tool
+        from tests.support.stub import make_tool
 
         tools = [
             make_tool("mcp_stock-sdk-mcp_get_a_share_quotes"),
@@ -314,7 +314,7 @@ class TestAgent(unittest.TestCase):
     @patch('fluxagent.core.agent.get_provider')
     def test_explicit_backend_blocks_wrong_tool_call_before_execution(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM, counting_tool
+        from tests.support.stub import ScriptedLLM, counting_tool
 
         calls = {}
         stock = counting_tool("mcp_stock-sdk-mcp_get_a_share_quotes", calls)
@@ -341,7 +341,7 @@ class TestAgent(unittest.TestCase):
     @patch('fluxagent.core.agent.get_provider')
     def test_explicit_backend_switch_drops_previous_backend_turn(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM, counting_tool
+        from tests.support.stub import ScriptedLLM, counting_tool
 
         cook = counting_tool("mcp_HowToCook-mcp_mcp_howtocook_whatToEat", {})
         tong = counting_tool("tong-jincheng-perspective", {})
@@ -367,7 +367,7 @@ class TestAgent(unittest.TestCase):
     @patch('fluxagent.core.agent.get_provider')
     def test_context_trim_metrics_reach_run_summary(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM
+        from tests.support.stub import ScriptedLLM
 
         llm = ScriptedLLM(script=["压缩摘要", "最终回答"])
         mock_get_provider.return_value = llm
@@ -496,7 +496,7 @@ class TestAgent(unittest.TestCase):
     def test_entry_route_uses_small_model_when_rules_abstain(self, mock_get_provider):
         """规则说不准的请求（两个动作、没有先后词）才愿意花一次小模型调用。"""
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM
+        from tests.support.stub import ScriptedLLM
 
         classifier = ScriptedLLM(script=['{"needs_plan": true}'])
         main = ScriptedLLM(
@@ -533,7 +533,7 @@ class TestAgent(unittest.TestCase):
     ):
         """分类器不吐合法布尔就保守回退成"不规划"，不能把请求卡死在入口。"""
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM
+        from tests.support.stub import ScriptedLLM
 
         classifier = ScriptedLLM(script=["我觉得需要规划吧"])
         main = ScriptedLLM(script=["直接回答"])
@@ -563,7 +563,7 @@ class TestAgent(unittest.TestCase):
     @patch('fluxagent.core.agent.get_provider')
     def test_rule_fast_path_never_spends_a_classifier_call(self, mock_get_provider):
         from fluxagent.core.agent import create_agent_app
-        from tests.eval.stub import ScriptedLLM
+        from tests.support.stub import ScriptedLLM
 
         classifier = ScriptedLLM(script=['{"needs_plan": true}'])
         main = ScriptedLLM(
@@ -597,7 +597,7 @@ class TestAgent(unittest.TestCase):
         import fluxagent.core.agent as agent_mod
         from fluxagent.core.agent import create_agent_app
         from fluxagent.core.budget import RunBudget
-        from tests.eval.stub import ScriptedLLM, make_tool
+        from tests.support.stub import ScriptedLLM, make_tool
 
         def reply(messages):
             prompt = " ".join(str(getattr(m, "content", "")) for m in messages)

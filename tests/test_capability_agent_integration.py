@@ -83,7 +83,7 @@ class TestMinimalToolBinding(unittest.TestCase):
 class TestGatewayInterceptsHallucination(unittest.TestCase):
     def test_hallucinated_out_of_scope_call_is_rejected_without_execution(self):
         """模型伪造未授权工具调用：不执行、不进审批、返回结构化错误。"""
-        from tests.eval.stub import counting_tool
+        from tests.support.stub import counting_tool
 
         stock = counting_tool("mcp_market_quotes", {})
         cook = counting_tool("mcp_cooking_meals", {})
@@ -230,7 +230,7 @@ class TestStepLevelReroute(unittest.TestCase):
     契约只增不删地扩充授权；伪造/未注册能力不能借步骤文本扩权。"""
 
     def test_second_step_gains_new_capability_authorization(self):
-        from tests.eval.stub import counting_tool
+        from tests.support.stub import counting_tool
 
         counter: dict[str, int] = {}
         cook = counting_tool("mcp_cooking_meals", counter)
@@ -269,7 +269,7 @@ class TestStepLevelReroute(unittest.TestCase):
         self.assertIn("mcp_cooking_meals", last_bound)
 
     def test_step_text_cannot_expand_to_unregistered_capability(self):
-        from tests.eval.stub import counting_tool
+        from tests.support.stub import counting_tool
 
         counter: dict[str, int] = {}
         cook = counting_tool("mcp_cooking_meals", counter)

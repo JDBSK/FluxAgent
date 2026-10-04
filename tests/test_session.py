@@ -24,7 +24,7 @@ from fluxagent.core.session import (
     thread_config,
 )
 from entry.session_cmd import handle_slash_command, sync_config_to_active
-from tests.eval.stub import ScriptedLLM, make_tool
+from tests.support.stub import ScriptedLLM, make_tool
 
 
 class TestSessionStore(unittest.TestCase):
