@@ -419,10 +419,13 @@ class HybridRouter:
         reranker: Optional[Any] = None,
         top_k: int = 8,
         min_rerank_score: float = 0.05,
+        min_dense_score: float = 0.35,
         contract_ttl_seconds: float = 600.0,
     ) -> None:
         if top_k < 1:
             raise ValueError("top_k 必须大于 0")
+        if not 0.0 <= min_dense_score <= 1.0:
+            raise ValueError("min_dense_score 必须在 0 到 1 之间")
         self.embedding_provider = embedding_provider
         from .retrieval import DeterministicEmbedding
 
@@ -435,6 +438,7 @@ class HybridRouter:
         )
         self.top_k = top_k
         self.min_rerank_score = min_rerank_score
+        self.min_dense_score = min_dense_score
         self.contract_ttl_seconds = contract_ttl_seconds
         self._bm25 = BM25Index()
         self._dense = DenseIndex()
@@ -723,9 +727,13 @@ class HybridRouter:
             from .retrieval import DeterministicEmbedding
 
             if not isinstance(self.embedding_provider, DeterministicEmbedding):
-                dense_ranking = self._dense.search(
-                    retrieval_text, self.embedding_provider, top_k=self.top_k
-                )
+                dense_ranking = [
+                    (doc_id, score)
+                    for doc_id, score in self._dense.search(
+                        retrieval_text, self.embedding_provider, top_k=self.top_k
+                    )
+                    if score >= self.min_dense_score
+                ]
                 rankings.append(dense_ranking)
         except EmbeddingError as exc:
             return self._decision(

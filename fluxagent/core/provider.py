@@ -19,6 +19,14 @@ from dotenv import load_dotenv
 '''
 load_dotenv()
 
+# 单次 LLM 请求的硬超时与重试上限。不设置时 openai SDK 默认可等 600s：
+# 一次挂起的调用会拖着整条串行流水线一起等（预算熔断只在节点边界检查，
+# 拦不住在途请求），必须在这里给出上限。可用环境变量覆盖。
+LLM_REQUEST_TIMEOUT_SECONDS = float(
+    os.getenv("FLUXAGENT_LLM_TIMEOUT_SECONDS", "120")
+)
+LLM_MAX_RETRIES = int(os.getenv("FLUXAGENT_LLM_MAX_RETRIES", "2"))
+
 # 各大厂商官方的 OpenAI 兼容接口地址 (当用户未配置 BASE_URL 时作为兜底)
 COMPATIBLE_BASE_URLS = {
     "aliyun": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -52,8 +60,11 @@ def get_provider(
         if not final_base_url:
             final_base_url = COMPATIBLE_BASE_URLS.get(provider_name) 
 
+        if "timeout" not in kwargs:
+            kwargs.setdefault("request_timeout", LLM_REQUEST_TIMEOUT_SECONDS)
+        kwargs.setdefault("max_retries", LLM_MAX_RETRIES)
         return ChatOpenAI(
-            model=model_name, 
+            model=model_name,
             temperature=temperature,
             api_key=current_api_key,
             base_url=final_base_url,
@@ -69,9 +80,12 @@ def get_provider(
             
         final_base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL")
 
+        if "default_request_timeout" not in kwargs:
+            kwargs.setdefault("timeout", LLM_REQUEST_TIMEOUT_SECONDS)
+        kwargs.setdefault("max_retries", LLM_MAX_RETRIES)
         return ChatAnthropic(
-            model_name=model_name, 
-            temperature=temperature, 
+            model_name=model_name,
+            temperature=temperature,
             api_key=current_api_key,
             base_url=final_base_url,
             **kwargs

@@ -16,6 +16,11 @@
   - replan：重新规划（整表替换 task_plan，不追加）
 
 工作流 = 这张 StateGraph 状态图（有条件分支、有循环、有状态持久化）。
+
+执行模型：agent/planner/replan/tools/initialize 是原生协程节点——LLM、工具
+与路由重算的等待发生在协程挂起或 to_thread 里，astream/ainvoke 路径不再占用
+线程池线程；approval/policy_block/progress/subagent_approval 等纯内存标记节点
+保持同步函数，由框架放进线程池执行。
 """
 
 import asyncio
@@ -27,6 +32,7 @@ import re
 import sys
 import threading
 import time
+from contextvars import ContextVar
 from typing import Any, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
@@ -1330,12 +1336,17 @@ def create_agent_app(
 
         return wrapped
 
-    def tools_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
+    async def tools_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
         """执行工具，并兼容旧 checkpoint 中的 ``v__args`` 参数名。
 
         旧版 ``install_mcp_server(args=...)`` 曾被 LangChain 生成成 ``v__args``。
         新调用统一使用 ``launch_args``，但已持久化的审批仍可能携带旧字段，
         因此在真正执行前做一次窄范围迁移。
+
+        工具本体经 ToolNode.ainvoke 执行（阻塞工具自动进线程池）；permission_broker
+        是 sqlite 文件 I/O，一律 asyncio.to_thread 下线程——特别是它与
+        AsyncSqliteSaver 可能共用同一个库文件，卡在循环上会与 checkpoint 写入
+        互等成死锁（busy_timeout 30s 后报 database is locked）。
         """
         messages = list(state.get("messages") or [])
         if messages:
@@ -1372,21 +1383,24 @@ def create_agent_app(
             if isinstance(message, HumanMessage):
                 user_text = str(message.content)
                 break
-        gateway = _gateway_for(thread_id, user_text)
+        # 路由重算可能触发 LLM 重排/远程 embedding（阻塞网络调用），放线程池
+        gateway = await asyncio.to_thread(_gateway_for, thread_id, user_text)
         broker_claims: dict[str, str] = {}
         approval_checked_calls: list[dict] = []
         rejected_messages: list[ToolMessage] = []
         for call in gate_calls:
             call_id = str(call.get("id", ""))
             if call.get("name") == "propose_memory_change":
-                action = permission_broker.find(thread_id=thread_id, tool_call_id=call_id)
+                action = await asyncio.to_thread(
+                    permission_broker.find, thread_id=thread_id, tool_call_id=call_id
+                )
                 if not require_approval or action is None or action.status != ActionStatus.APPROVED:
                     content = json.dumps({"ok": False, "error": {
                         "code": "memory_approval_required",
                         "message": "记忆变更必须有当前调用对应的人工批准记录。",
                         "retryable": False,
                     }}, ensure_ascii=False)
-                elif permission_broker.claim(action.action_id):
+                elif await asyncio.to_thread(permission_broker.claim, action.action_id):
                     broker_claims[call_id] = action.action_id
                     approval_checked_calls.append(call)
                     continue
@@ -1407,7 +1421,8 @@ def create_agent_app(
             if not decision.needs_approval:
                 approval_checked_calls.append(call)
                 continue
-            action = permission_broker.find(
+            action = await asyncio.to_thread(
+                permission_broker.find,
                 thread_id=thread_id, tool_call_id=call_id
             )
             if action is None:
@@ -1422,19 +1437,21 @@ def create_agent_app(
                     {"ok": False, "error": {"code": "approval_not_granted", "message": f"审批状态为 {action.status.value}，未执行。", "retryable": False}},
                     ensure_ascii=False,
                 )
-            elif not permission_broker.resource_is_current(action):
+            elif not await asyncio.to_thread(permission_broker.resource_is_current, action):
                 content = json.dumps(
                     {"ok": False, "error": {"code": "resource_conflict", "message": "审批后目标文件发生变化，拒绝覆盖。", "retryable": False}},
                     ensure_ascii=False,
                 )
-                if permission_broker.claim(action.action_id):
-                    permission_broker.fail(action.action_id, content, "resource_conflict")
-            elif permission_broker.claim(action.action_id):
+                if await asyncio.to_thread(permission_broker.claim, action.action_id):
+                    await asyncio.to_thread(
+                        permission_broker.fail, action.action_id, content, "resource_conflict"
+                    )
+            elif await asyncio.to_thread(permission_broker.claim, action.action_id):
                 broker_claims[call_id] = action.action_id
                 approval_checked_calls.append(call)
                 continue
             else:
-                current = permission_broker.get(action.action_id)
+                current = await asyncio.to_thread(permission_broker.get, action.action_id)
                 if current is not None and current.status == ActionStatus.SUCCEEDED:
                     content = current.result
                 else:
@@ -1465,7 +1482,8 @@ def create_agent_app(
             else:
                 action_id = broker_claims.pop(str(call.get("id", "")), "")
                 if action_id:
-                    permission_broker.fail(
+                    await asyncio.to_thread(
+                        permission_broker.fail,
                         action_id, verdict.to_tool_message_content(), verdict.status.value
                     )
                 rejected_messages.append(
@@ -1493,7 +1511,9 @@ def create_agent_app(
             call_id = str(call.get("id", ""))
             action_id = broker_claims.get(call_id, "")
             args = dict(call.get("args") or {})
-            reason = _validate_memory_change(args, user_text, memory_store)
+            reason = await asyncio.to_thread(
+                _validate_memory_change, args, user_text, memory_store
+            )
             if not action_id:
                 reason = reason or "缺少已消费的人工审批动作。"
             if reason:
@@ -1506,7 +1526,8 @@ def create_agent_app(
                 ))
                 continue
             try:
-                _append_memory_event(
+                await asyncio.to_thread(
+                    _append_memory_event,
                     "memory_change",
                     {key: str(args.get(key) or "") for key in (
                         "operation", "scope", "semantic_key", "value", "evidence"
@@ -1528,7 +1549,7 @@ def create_agent_app(
                 ))
         if executable_calls:
             messages[-1] = messages[-1].model_copy(update={"tool_calls": executable_calls})
-            result_state = tool_node.invoke({"messages": messages})
+            result_state = await tool_node.ainvoke({"messages": messages})
             produced = list(result_state.get("messages", [])) + memory_call_messages
         else:
             produced = memory_call_messages
@@ -1551,9 +1572,13 @@ def create_agent_app(
             action_id = broker_claims.get(call_id, "")
             if action_id:
                 if failed:
-                    permission_broker.fail(action_id, str(outcome.content))
+                    await asyncio.to_thread(
+                        permission_broker.fail, action_id, str(outcome.content)
+                    )
                 else:
-                    permission_broker.succeed(action_id, str(outcome.content))
+                    await asyncio.to_thread(
+                        permission_broker.succeed, action_id, str(outcome.content)
+                    )
             if call_id and call_id not in processed:
                 processed.append(call_id)
             if call_id and not failed:
@@ -1565,7 +1590,8 @@ def create_agent_app(
                 operation = snapshot_now.find_by_operation(tool_name)
                 try:
                     if tool_name != "propose_memory_change":
-                        _append_memory_event(
+                        await asyncio.to_thread(
+                            _append_memory_event,
                             "tool_succeeded",
                             {
                                 "key": f"experience:{thread_id}:{tool_name}",
@@ -1590,7 +1616,8 @@ def create_agent_app(
                 continue
             operation = snapshot_now.find_by_operation(tool_name)
             try:
-                _append_memory_event(
+                await asyncio.to_thread(
+                    _append_memory_event,
                     "tool_failed",
                     {
                         "key": (
@@ -1638,6 +1665,20 @@ def create_agent_app(
             )
         return updates
     llm = get_provider(provider_name=provider_name, model_name=model_name)
+    _sync_execution = ContextVar("fluxagent_sync_execution", default=False)
+
+    async def _ainvoke(model, messages, config):
+        """异步入口优先原生 ainvoke；同步入口保留 provider 的同步客户端，
+        避免跨节点的临时事件循环复用已绑定旧循环的异步连接池。
+        只有同步 invoke 的替身或封装也在线程池执行。"""
+        model_ainvoke = getattr(model, "ainvoke", None)
+        if (
+            not _sync_execution.get()
+            and callable(model_ainvoke)
+            and inspect.iscoroutinefunction(model_ainvoke)
+        ):
+            return await model_ainvoke(messages, config=config)
+        return await asyncio.to_thread(model.invoke, messages, config=config)
 
     def _resolve_entry_plan(state: AgentState, config: RunnableConfig | None) -> dict:
         """混合路由：规则快筛 -> 小模型确认；任何异常都退回保守的"不规划"。
@@ -1678,7 +1719,7 @@ def create_agent_app(
             "planning_request"  : request,         # 规划请求的文本内容
         }
 
-    def initialize_run_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
+    async def initialize_run_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
         """在新一轮用户请求开始时重置运行状态。taskplan/retrycount等记录都清零"""
         messages = state.get("messages") or []
         if not messages or not isinstance(messages[-1], HumanMessage):
@@ -1720,7 +1761,7 @@ def create_agent_app(
             "pending_action_ids": [],
         }
         if enable_planner:
-            updates.update(_resolve_entry_plan(state, config))
+            updates.update(await asyncio.to_thread(_resolve_entry_plan, state, config))
         else:
             updates.update({
                 "entry_needs_plan": False,
@@ -1895,7 +1936,7 @@ def create_agent_app(
         updates["last_run_summary"] = build_run_summary({**state, **updates})
         return updates
 
-    def agent_node(state: AgentState, config: RunnableConfig) -> dict:
+    async def agent_node(state: AgentState, config: RunnableConfig) -> dict:
         """调用 LLM 处理当前状态，并生成回复或工具调用。"""
         thread_id = config.get("configurable", {}).get(
             "thread_id", "system_default")
@@ -1919,11 +1960,13 @@ def create_agent_app(
             None,
         )  # 获取最近的用户消息,避免工具调用或AI消息干扰
         user_text = str(last_human.content) if last_human else ""
-        decision, turn_contract, scoped_tools, scope_label = _turn_contract(
-            thread_id, user_text
+        # 路由重算可能触发 LLM 重排/远程 embedding（阻塞网络调用），放线程池
+        decision, turn_contract, scoped_tools, scope_label = await asyncio.to_thread(
+            _turn_contract, thread_id, user_text
         )
         # 步骤级重路由：计划推进到需要契约外能力的新步骤时扩充授权
-        decision, turn_contract, scoped_tools = _maybe_step_reroute(
+        decision, turn_contract, scoped_tools = await asyncio.to_thread(
+            _maybe_step_reroute,
             thread_id, user_text, state, decision, turn_contract, scoped_tools, scope_label
         )
         route_observation = _route_observation(
@@ -2027,8 +2070,8 @@ def create_agent_app(
                 + "\n\nCompress into a concise recent summary. Keep facts, preferences, open items."
             )  # 压缩上下文的prompt,把旧对话压缩成摘要,减少上下文长度,保留事实、偏好、未完成事项
             state_updates.update(bump_llm_calls({**state, **state_updates}, 1))
-            new_summary_response = llm.invoke(
-                [HumanMessage(content=summary_prompt)], config={"callbacks": []}
+            new_summary_response = await _ainvoke(
+                llm, [HumanMessage(content=summary_prompt)], config={"callbacks": []}
             )
             active_summary = new_summary_response.content
             state_updates["summary"] = active_summary
@@ -2066,30 +2109,32 @@ def create_agent_app(
         memory_context = None
         memory_retriever = getattr(context_compiler, "memory_retriever", None)
         if memory_retriever is not None and hasattr(memory_retriever, "retrieve_context"):
-            memory_context = memory_retriever.retrieve_context(
+            memory_context = await asyncio.to_thread(
+                memory_retriever.retrieve_context,
                 query=user_text,
                 scopes=context_compiler._scopes_for(decision.memory_scopes),
                 capability_ids=decision.capability_ids or None,
                 intent=decision.intent,
                 session_id=thread_id,
             )
-        compiled = context_compiler.compile(
-            CompilationContext(
-                user_text=user_text,
-                route=decision.route,
-                intent=decision.intent,
-                capability_ids=decision.capability_ids,
-                memory_scopes=decision.memory_scopes,
-                history_digest=active_summary or "",
-                failure_facts=failure_facts,
-                skill_context=skill_context,
-                session_id=thread_id,
-                allowed_tool_names=tuple(str(t.name) for t in scoped_tools),
-                skill_is_context_only=bool(
-                    skill_context and not decision.allowed_tool_ids
-                ),
+        compilation_input = CompilationContext(
+            user_text=user_text,
+            route=decision.route,
+            intent=decision.intent,
+            capability_ids=decision.capability_ids,
+            memory_scopes=decision.memory_scopes,
+            history_digest=active_summary or "",
+            failure_facts=failure_facts,
+            skill_context=skill_context,
+            session_id=thread_id,
+            allowed_tool_names=tuple(str(t.name) for t in scoped_tools),
+            skill_is_context_only=bool(
+                skill_context and not decision.allowed_tool_ids
             ),
-            memory_context=memory_context,
+        )
+        # compile 内部可能做远程 embedding 检索，放线程池
+        compiled = await asyncio.to_thread(
+            context_compiler.compile, compilation_input, memory_context=memory_context
         )
         audit_logger.log_event(
             thread_id=thread_id,
@@ -2190,7 +2235,7 @@ def create_agent_app(
         # boundary for providers that honor tool schemas, rather than a soft
         # "prefer" instruction competing with unrelated MCP descriptions.
         # 透传运行 config（thread_id/callbacks/run_id），供追踪与回调使用。
-        response = llm.bind_tools(scoped_tools).invoke(msgs_for_llm, config=config)  # 真正能使用的工具，无法模型不能单凭文字凭空获取新工具
+        response = await _ainvoke(llm.bind_tools(scoped_tools), msgs_for_llm, config)  # 真正能使用的工具，无法模型不能单凭文字凭空获取新工具
         unverified_claim = _has_unverified_action_claim(response.content)  # 检测 LLM 回复中是否有声称执行了操作但没有结构化 tool_calls 的情况
         if not response.tool_calls:
             recovered = _install_call_from_user_request(
@@ -2285,7 +2330,7 @@ def create_agent_app(
                 )
         return state_updates
 
-    def planner_node(state: AgentState, config: RunnableConfig) -> dict:
+    async def planner_node(state: AgentState, config: RunnableConfig) -> dict:
         """将需要规划的用户目标拆分为可执行步骤。"""
         thread_id = config.get("configurable", {}).get(
             "thread_id", "system_default")
@@ -2304,7 +2349,7 @@ def create_agent_app(
         prompt = _build_planner_prompt(str(goal))
         updates.update(bump_llm_calls({**state, **updates}, 1))
         try:
-            resp = llm.invoke([HumanMessage(content=prompt)],
+            resp = await _ainvoke(llm, [HumanMessage(content=prompt)],
                               config={"callbacks": []})
             plan = _parse_plan(resp.content)
         except Exception as exc:
@@ -2352,7 +2397,7 @@ def create_agent_app(
         )
         return updates
 
-    def replan_node(state: AgentState, config: RunnableConfig) -> dict:
+    async def replan_node(state: AgentState, config: RunnableConfig) -> dict:
         """根据最近失败生成替代计划并替换原计划。"""
         thread_id = config.get("configurable", {}).get(
             "thread_id", "system_default")
@@ -2377,7 +2422,7 @@ def create_agent_app(
             "last_failure_class", ""), step_index=state.get("step_index", 0))
         updates.update(bump_llm_calls({**state, **updates}, 1))
         try:
-            resp = llm.invoke([HumanMessage(content=prompt)],
+            resp = await _ainvoke(llm, [HumanMessage(content=prompt)],
                               config={"callbacks": []})
             plan_actions = [s.get("action", "")
                             for s in _parse_plan(resp.content)]
@@ -2934,9 +2979,40 @@ def create_agent_app(
     # ================构建agent工作流的状态图==================
     # 添加8个节点
     workflow = StateGraph(AgentState)
-    workflow.add_node("initialize", _instrument_node("initialize", initialize_run_node))  # 初始化
-    workflow.add_node("planner", _instrument_node("planner", planner_node))               # 规划器节点
-    workflow.add_node("agent", _instrument_node("agent", agent_node))                     # 智能体节点
+
+    # I/O 密集节点（LLM/工具/路由重算）注册为原生协程：astream/ainvoke 路径上
+    # 等待不再占用线程池线程；同步 invoke 入口用 asyncio.run 兜底，与下方
+    # subagents 节点的双通道注册同一模式。
+    def _sync_node(async_node):
+        def run(state, config=None):
+            token = _sync_execution.set(True)
+            try:
+                return asyncio.run(async_node(state, config))
+            finally:
+                _sync_execution.reset(token)
+        return run
+
+    workflow.add_node(
+        "initialize",
+        RunnableLambda(
+            _instrument_node("initialize", _sync_node(initialize_run_node)),
+            afunc=_instrument_node("initialize", initialize_run_node),
+        ),
+    )  # 初始化
+    workflow.add_node(
+        "planner",
+        RunnableLambda(
+            _instrument_node("planner", _sync_node(planner_node)),
+            afunc=_instrument_node("planner", planner_node),
+        ),
+    )  # 规划器节点
+    workflow.add_node(
+        "agent",
+        RunnableLambda(
+            _instrument_node("agent", _sync_node(agent_node)),
+            afunc=_instrument_node("agent", agent_node),
+        ),
+    )  # 智能体节点
     workflow.add_node("approval", _instrument_node("approval", approval_node))            # 审批节点
     def subagents_node_sync(
         state: AgentState, config: RunnableConfig | None = None
@@ -2955,9 +3031,21 @@ def create_agent_app(
         _instrument_node("subagent_approval", subagent_approval_node),
     )
     workflow.add_node("policy_block", _instrument_node("policy_block", policy_block_node))  # 策略拦截节点
-    workflow.add_node("tools", _instrument_node("tools", tools_node))                       # 工具调用节点
+    workflow.add_node(
+        "tools",
+        RunnableLambda(
+            _instrument_node("tools", _sync_node(tools_node)),
+            afunc=_instrument_node("tools", tools_node),
+        ),
+    )  # 工具调用节点
     workflow.add_node("progress", _instrument_node("progress", progress_node))              # 进度更新节点
-    workflow.add_node("replan", _instrument_node("replan", replan_node))                    # 重规划节点
+    workflow.add_node(
+        "replan",
+        RunnableLambda(
+            _instrument_node("replan", _sync_node(replan_node)),
+            afunc=_instrument_node("replan", replan_node),
+        ),
+    )  # 重规划节点
 
     # 连边——先连固定边（无条件跳转）\一定转移
     workflow.add_edge(START, "initialize")  # 入口 → 初始化
