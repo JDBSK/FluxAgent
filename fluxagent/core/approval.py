@@ -81,7 +81,9 @@ def _action_call(record: ActionRecord) -> dict[str, Any]:
     }
 
 
-def _register_main_actions(app, thread_id: str, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _register_main_actions(
+    app, thread_id: str, calls: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     broker = getattr(app, "permission_broker", None)
     if not isinstance(broker, PermissionBroker):
         broker = None
@@ -90,12 +92,20 @@ def _register_main_actions(app, thread_id: str, calls: list[dict[str, Any]]) -> 
     result = []
     policy = getattr(app, "policy_config", None)
     for call in calls:
+        decision = assess_tool_calls([call], config=policy, require_approval=True)
+        if decision.hard_deny or (
+            not decision.needs_approval and call.get("name") != "propose_memory_change"
+        ):
+            continue
         existing = broker.find(
             thread_id=thread_id,
             tool_call_id=str(call.get("id") or ""),
         )
+        if existing is not None and not existing.matches_call(
+            str(call.get("name") or ""), call.get("args")
+        ):
+            continue
         if existing is None:
-            decision = assess_tool_calls([call], config=policy, require_approval=True)
             assessment = decision.assessments[0]
             existing = broker.register(
                 thread_id=thread_id,
@@ -134,14 +144,42 @@ def approve_prepare(app, config: dict, tool_calls: Optional[list] = None) -> Non
     broker = getattr(app, "permission_broker", None)
     if not isinstance(broker, PermissionBroker):
         broker = None
+    approved_tools = []
     for call in tool_calls or []:
         action_id = str(call.get("action_id") or "")
-        if action_id and broker is not None:
-            broker.approve(action_id)
-    audit_logger.log_event(
-        thread_id=thread_id, event="system_action", action="approval_granted",
-        tools=[tc.get("name") for tc in (tool_calls or [])],
-    )
+        if broker is None:
+            approved_tools.append(call.get("name"))
+        elif action_id:
+            action = broker.get(action_id)
+            if (
+                action is not None
+                and action.thread_id == thread_id
+                and action.tool_call_id == call.get("id")
+                and action.matches_call(str(call.get("name") or ""), call.get("args"))
+                and broker.approve(action_id)
+            ):
+                approved_tools.append(action.tool_name)
+    if approved_tools:
+        audit_logger.log_event(
+            thread_id=thread_id, event="system_action", action="approval_granted",
+            tools=approved_tools,
+        )
+
+
+def _cancelled_updates(snapshot, tool_calls: list[dict[str, Any]], reason: str) -> dict:
+    # Only writes and other gated calls are shown in the prompt. LangGraph still
+    # needs a reply for every call in the original batch when it skips execution.
+    if "approval" in snapshot.next:
+        messages = snapshot.values.get("messages") or []
+        if messages:
+            tool_calls = getattr(messages[-1], "tool_calls", None) or tool_calls
+    return {
+        "messages": [
+            ToolMessage(content=reason, tool_call_id=tc["id"], name=tc.get("name", ""))
+            for tc in tool_calls
+        ],
+        "task_status": TASK_CANCELLED,
+    }
 
 
 def reject_prepare(
@@ -168,12 +206,8 @@ def reject_prepare(
             tools=[tc.get("name") for tc in tool_calls],
         )
         return
-    tool_msgs = [
-        ToolMessage(content=reason, tool_call_id=tc["id"], name=tc.get("name", ""))
-        for tc in tool_calls
-    ]
     app.update_state(
-        config, {"messages": tool_msgs, "task_status": TASK_CANCELLED}, as_node="tools"
+        config, _cancelled_updates(app.get_state(config), tool_calls, reason), as_node="tools"
     )
     audit_logger.log_event(
         thread_id=thread_id, event="system_action", action="approval_denied",
@@ -201,12 +235,9 @@ async def areject_prepare(
             tools=[tc.get("name") for tc in tool_calls],
         )
         return
-    tool_msgs = [
-        ToolMessage(content=reason, tool_call_id=tc["id"], name=tc.get("name", ""))
-        for tc in tool_calls
-    ]
+    snapshot = await app.aget_state(config)
     await app.aupdate_state(
-        config, {"messages": tool_msgs, "task_status": TASK_CANCELLED}, as_node="tools"
+        config, _cancelled_updates(snapshot, tool_calls, reason), as_node="tools"
     )
     audit_logger.log_event(
         thread_id=thread_id, event="system_action", action="approval_denied",

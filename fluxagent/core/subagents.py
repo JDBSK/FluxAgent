@@ -414,6 +414,19 @@ class SubagentRunner:
                         "reason": "tool_not_granted_to_child",
                     }
                     continue
+                # Workspace tools use the same side-effect-free preflight as the
+                # parent agent.  This runs before an approval record is created,
+                # so invalid paths/commands never become approval prompts.
+                preflight_error = sandbox_tools.preflight_tool_call(
+                    name, call.get("args") or {}
+                )
+                if preflight_error:
+                    blocked[call_id] = {
+                        "tool": name,
+                        "args": _redact(call.get("args") or {}),
+                        "reason": preflight_error,
+                    }
+                    continue
                 decision = assess_tool_calls([call], config=self.policy_cfg, require_approval=True)
                 assessment = decision.assessments[0]
                 if decision.hard_deny:
@@ -505,6 +518,15 @@ class SubagentRunner:
                         content = _error("action_in_progress", "相同动作正在执行，未重复运行。")
                     elif action.status != ActionStatus.APPROVED:
                         content = _error("approval_required", "动作尚未获得人工批准。")
+                    elif not action.matches_call(name, args):
+                        content = _error(
+                            "approval_mismatch",
+                            "工具或参数与人工批准的内容不一致，未执行。",
+                        )
+                    elif (
+                        preflight_error := sandbox_tools.preflight_tool_call(name, args)
+                    ):
+                        content = preflight_error
                     elif not await asyncio.to_thread(self.permission_broker.claim, action_id):
                         content = _error("duplicate_execution", "动作执行权已被其他执行器占用。")
                     else:

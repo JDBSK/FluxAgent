@@ -62,6 +62,14 @@ class ActionRecord:
     executing_at: Optional[float] = None
     finished_at: Optional[float] = None
 
+    def matches_call(self, tool_name: str, args: Mapping[str, Any] | None) -> bool:
+        """Only the exact reviewed tool and JSON payload share an approval."""
+        return (
+            self.tool_name == tool_name
+            and isinstance(args, Mapping)
+            and _json(self.args) == _json(dict(args))
+        )
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
@@ -316,12 +324,13 @@ class PermissionBroker:
             self._expire_locked(now)
             cursor = self._conn.execute(
                 "UPDATE permission_actions SET status=?, executing_at=? "
-                "WHERE action_id=? AND status=?",
+                "WHERE action_id=? AND status=? AND expires_at>?",
                 (
                     ActionStatus.EXECUTING.value,
                     now,
                     action_id,
                     ActionStatus.APPROVED.value,
+                    now,
                 ),
             )
             return cursor.rowcount == 1
@@ -382,12 +391,13 @@ class PermissionBroker:
     def _expire_locked(self, now: float) -> None:
         self._conn.execute(
             "UPDATE permission_actions SET status=?, finished_at=?, error_code=? "
-            "WHERE status=? AND expires_at<=?",
+            "WHERE status IN (?, ?) AND expires_at<=?",
             (
                 ActionStatus.EXPIRED.value,
                 now,
                 "approval_expired",
                 ActionStatus.PENDING.value,
+                ActionStatus.APPROVED.value,
                 now,
             ),
         )

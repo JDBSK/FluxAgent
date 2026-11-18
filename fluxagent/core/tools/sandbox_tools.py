@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import Any, BinaryIO, Mapping
 
 from .base import fluxagent_tool
 from ..config import OFFICE_DIR
@@ -132,11 +132,11 @@ def _safe_argument_path(value: str) -> bool:
     parts = token.replace("\\", "/").split("/")
     if ".." in parts:
         return False
-    if "/" in token or "\\" in token:
-        try:
-            _get_safe_path(token)
-        except (OSError, TypeError, ValueError):
-            return False
+    # 单文件名也可能是指向工位外的链接，不能只检查带分隔符的参数。
+    try:
+        _get_safe_path(token)
+    except (OSError, TypeError, ValueError):
+        return False
     return True
 
 
@@ -286,7 +286,9 @@ def _plan_compound(tokens: list[tuple[str, str]]) -> list[_CompoundCommand]:
         for arg in current[1:]:
             if not _safe_argument_path(arg):
                 raise PermissionError(f"参数越界：{arg}。所有路径必须限制在 office 工位内。")
-        stages.append(_Stage(head, list(current[1:])))
+        stage = _Stage(head, list(current[1:]))
+        _validate_builtin_stage(stage, has_stdin=bool(stages))
+        stages.append(stage)
         current = []
 
     def close_command() -> None:
@@ -327,11 +329,41 @@ def _plan_compound(tokens: list[tuple[str, str]]) -> list[_CompoundCommand]:
     if commands and commands[0].connector:
         raise ValueError("复合命令不能以运算符开头。")
     for command in commands:
-        if command.redirect is not None and not _safe_argument_path(command.redirect[1]):
-            raise PermissionError(
-                f"重定向目标越界：{command.redirect[1]}。输出必须落在 office 工位内。"
-            )
+        if command.redirect is not None:
+            target = command.redirect[1]
+            if not _safe_argument_path(target):
+                raise PermissionError(
+                    f"重定向目标越界：{target}。输出必须落在 office 工位内。"
+                )
+            _get_safe_path(target)
     return commands
+
+
+def _validate_builtin_stage(stage: _Stage, *, has_stdin: bool) -> None:
+    """按内置命令的实际参数语义检查路径，不读取内容或执行命令。"""
+    name, args = stage.name, stage.args
+    paths: list[str] = []
+    if name in {"dir", "ls"}:
+        if len(args) > 1:
+            raise ValueError(f"{name}: 最多允许一个目录参数。")
+        paths = args or ["."]
+    elif name in {"cat", "type"}:
+        if not args and not has_stdin:
+            raise ValueError(f"{name}: 缺少文件参数且无管道输入。")
+        paths = args
+    elif name in {"grep", "findstr"}:
+        if not args:
+            raise ValueError(f"{name}: 缺少 pattern 参数。")
+        if len(args) == 1 and not has_stdin:
+            raise ValueError(f"{name}: 缺少文件参数且无管道输入。")
+        paths = args[1:]
+    elif name in {"mkdir", "md"}:
+        if len(args) != 1:
+            raise ValueError(f"{name}: 需要恰好一个目录参数。")
+        paths = args
+    for path in paths:
+        # 文件参数以 '-' 开头也不是选项；执行器会直接将其解释为路径。
+        _get_safe_path(path)
 
 
 def _read_stage_files(paths: list[str]) -> tuple[list[str], list[str]]:
@@ -600,23 +632,20 @@ def read_office_file(filepath: str) -> str:
 def write_office_file(filepath: str, content: str, mode: str = "w") -> str:
     """创建、替换或追加一个受限制的 UTF-8 文件在office根目录内."""
     try:
-        if mode not in {"w", "a"}:
-            return _tool_error("invalid_mode", "mode 参数必须是 'w' 或 'a'。")
-        encoded = str(content).encode("utf-8")
-        if len(encoded) > MAX_WRITE_BYTES:
-            return _tool_error("payload_too_large", f"单次写入超过 {MAX_WRITE_BYTES} 字节限制。")
+        error = _write_request_error(filepath, content, mode)
+        if error:
+            return error
 
         # --------- 使用获取锁保证路径安全，避免并发写入冲突 ---------
         target_path = _get_safe_path(filepath)
         lock = _path_lock(target_path)  # 获取路径锁，确保同一文件的并发写入安全
         # with clock = lock.acquire(blocking=True)阻塞等待,退出with块自动释放锁
         with lock:
+            error = _write_request_error(filepath, content, mode)
+            if error:
+                return error
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             target_path = _get_safe_path(filepath)
-            # 检查文件大小限制
-            if mode == "a" and os.path.exists(target_path):
-                if os.path.getsize(target_path) + len(encoded) > MAX_WRITE_BYTES:
-                    return _tool_error("file_too_large", f"追加后文件将超过 {MAX_WRITE_BYTES} 字节限制。")
             # 写入文件
             if mode == "a":
                 with open(target_path, "a", encoding="utf-8") as handle:
@@ -689,17 +718,42 @@ def _uses_compound_path(command: str) -> bool:
     return head in _COMPOUND_BUILTINS or _has_unquoted_operator(stripped)
 
 
+def validate_office_shell(command: str) -> list[str] | list[_CompoundCommand]:
+    """复用执行器的命令规划；仅解析和检查路径，不启动进程。"""
+    if _uses_compound_path(command):
+        return _plan_compound(_tokenize_compound(command))
+    return _parse_command(command)
+
+
+def _write_request_error(filepath: str, content: str, mode: str) -> str | None:
+    """预检和执行共用的写入限制；不创建目录、临时文件或目标文件。"""
+    if mode not in {"w", "a"}:
+        return _tool_error("invalid_mode", "mode 参数必须是 'w' 或 'a'。")
+    # 文本模式在 Windows 会将换行转换为 CRLF；配额按实际写入字节计算。
+    encoded_size = len(content.replace("\n", os.linesep).encode("utf-8"))
+    if encoded_size > MAX_WRITE_BYTES:
+        return _tool_error("payload_too_large", f"单次写入超过 {MAX_WRITE_BYTES} 字节限制。")
+    target_path = _get_safe_path(filepath)
+    if os.path.exists(target_path) and not os.path.isfile(target_path):
+        return _tool_error("not_file", f"不是普通文件：{filepath}")
+    if mode == "a":
+        existing_size = os.path.getsize(target_path) if os.path.exists(target_path) else 0
+        separator_size = len(os.linesep.encode("utf-8")) if content and not content.startswith("\n") else 0
+        if existing_size + separator_size + encoded_size > MAX_WRITE_BYTES:
+            return _tool_error("file_too_large", f"追加后文件将超过 {MAX_WRITE_BYTES} 字节限制。")
+    return None
+
+
 @fluxagent_tool
 def execute_office_shell(command: str) -> str:
     """运行一个允许的 argv 命令，但不使用命令行 shell."""
     try:
         with _WORKSPACE_SHELL_LOCK:
+            plan = validate_office_shell(command)
             if _uses_compound_path(command):
-                plan = _plan_compound(_tokenize_compound(command))
                 returncode, stdout, stderr = _run_compound(plan)
             else:
-                args = _parse_command(command)
-                returncode, stdout, stderr = _run_command(args)
+                returncode, stdout, stderr = _run_command(plan)
         if returncode != 0:
             return _tool_error("command_failed", f"命令退出码 {returncode}：{(stderr or stdout)[-1000:]}")
         output = (
@@ -725,3 +779,46 @@ def execute_office_shell(command: str) -> str:
         return _tool_error("output_limit", str(exc))
     except (OSError, subprocess.SubprocessError) as exc:
         return _tool_error("command_error", str(exc), retryable=True)
+
+
+def preflight_tool_call(name: str, args: Mapping[str, Any] | None) -> str | None:
+    """检查工位工具的参数，失败返回错误 JSON；成功或非工位工具返回 None。
+
+    工具登记和本轮授权由上层负责。这里只做 schema、路径和配额检查；不读取
+    文件内容，不创建文件/目录，也不调用命令执行器。执行时仍必须重新检查。
+    """
+    workspace_tools = {
+        "list_office_files": list_office_files,
+        "read_office_file": read_office_file,
+        "write_office_file": write_office_file,
+        "execute_office_shell": execute_office_shell,
+    }
+    tool = workspace_tools.get(name)
+    if tool is None:
+        return None
+    if not isinstance(args, Mapping):
+        return _tool_error("invalid_arguments", "工具参数必须是对象。")
+    try:
+        schema = tool.get_input_schema()
+        if set(args) - set(schema.model_fields):
+            return _tool_error("invalid_arguments", "工具参数包含未声明字段。")
+        values = schema.model_validate(dict(args)).model_dump()
+        if name == "execute_office_shell":
+            validate_office_shell(values["command"])
+        elif name == "write_office_file":
+            return _write_request_error(values["filepath"], values["content"], values["mode"])
+        else:
+            relative = values.get("filepath", values.get("sub_dir", ""))
+            # 预检只锁定路径边界。文件是否存在、类型和大小交给实际工具
+            # 处理，避免把正常的“检查是否存在”误当成策略违规。
+            _get_safe_path(relative)
+        return None
+    except PermissionError as exc:
+        return _tool_error("sandbox_violation", str(exc))
+    except FileNotFoundError as exc:
+        return _tool_error("command_not_found", str(exc))
+    except (TypeError, ValueError) as exc:
+        code = "invalid_command" if name == "execute_office_shell" else "invalid_arguments"
+        return _tool_error(code, str(exc))
+    except OSError as exc:
+        return _tool_error("filesystem_error", str(exc), retryable=True)

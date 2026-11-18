@@ -99,6 +99,7 @@ from .recovery import (
 
 from .skill_loader import load_dynamic_skills
 from .tools.builtins import BUILTIN_TOOLS
+from .tools import sandbox_tools
 
 from ..capability.context_compiler import (
     CompilationContext,
@@ -1122,6 +1123,31 @@ def create_agent_app(
         _decision, _contract, scoped, label = _turn_contract(thread_id, user_text)
         return scoped, label
 
+    def _tool_preflight(
+        call: dict[str, Any], *, thread_id: str, user_text: str
+    ) -> str | None:
+        """Validate the selected tool and payload without acquiring breaker permits."""
+        name = str(call.get("name") or "")
+        scoped, _label = _turn_contract_cached_tools(thread_id, user_text)
+        tool = next((item for item in scoped if str(item.name) == name), None)
+        operation = capability_registry.snapshot().find_by_operation(name)
+        if tool is None or operation is None:
+            return sandbox_tools._tool_error("route_mismatch", "工具未登记或不在本轮允许集合内。")
+        args = call.get("args")
+        if not isinstance(args, dict):
+            return sandbox_tools._tool_error("invalid_arguments", "工具参数必须是对象。")
+        schema_error = ExecutionGateway._validate_schema(operation.input_schema, args)
+        if schema_error:
+            return sandbox_tools._tool_error("schema_error", schema_error)
+        workspace_tool = getattr(sandbox_tools, name, None)
+        if workspace_tool is tool or (
+            workspace_tool is not None
+            and getattr(tool, "func", None) is not None
+            and getattr(tool, "func", None) is getattr(workspace_tool, "func", None)
+        ):
+            return sandbox_tools.preflight_tool_call(name, args)
+        return None
+
     def _reset_turn_scope(thread_id: str) -> None:
         with _router_lock:
             _turn_scopes.pop(thread_id, None)
@@ -1349,12 +1375,12 @@ def create_agent_app(
         互等成死锁（busy_timeout 30s 后报 database is locked）。
         """
         messages = list(state.get("messages") or [])
+        original_calls = getattr(messages[-1], "tool_calls", None) or [] if messages else []
         if messages:
             last = messages[-1]
-            calls = getattr(last, "tool_calls", None) or []
             normalized_calls = []
             changed = False
-            for call in calls:
+            for call in original_calls:
                 args = dict(call.get("args") or {})
                 if (
                     call.get("name") == "install_mcp_server"
@@ -1388,8 +1414,17 @@ def create_agent_app(
         broker_claims: dict[str, str] = {}
         approval_checked_calls: list[dict] = []
         rejected_messages: list[ToolMessage] = []
-        for call in gate_calls:
+        for call, original_call in zip(gate_calls, original_calls):
             call_id = str(call.get("id", ""))
+            preflight_error = await asyncio.to_thread(
+                _tool_preflight, call, thread_id=thread_id, user_text=user_text
+            )
+            if preflight_error:
+                rejected_messages.append(ToolMessage(
+                    content=preflight_error, tool_call_id=call_id,
+                    name=str(call.get("name") or ""), status="error",
+                ))
+                continue
             if call.get("name") == "propose_memory_change":
                 action = await asyncio.to_thread(
                     permission_broker.find, thread_id=thread_id, tool_call_id=call_id
@@ -1398,6 +1433,12 @@ def create_agent_app(
                     content = json.dumps({"ok": False, "error": {
                         "code": "memory_approval_required",
                         "message": "记忆变更必须有当前调用对应的人工批准记录。",
+                        "retryable": False,
+                    }}, ensure_ascii=False)
+                elif not action.matches_call(str(call.get("name") or ""), call.get("args")):
+                    content = json.dumps({"ok": False, "error": {
+                        "code": "approval_mismatch",
+                        "message": "工具或参数与人工批准的内容不一致，未执行。",
                         "retryable": False,
                     }}, ensure_ascii=False)
                 elif await asyncio.to_thread(permission_broker.claim, action.action_id):
@@ -1418,13 +1459,37 @@ def create_agent_app(
             decision = assess_tool_calls(
                 [call], config=policy_cfg, require_approval=require_approval
             )
-            if not decision.needs_approval:
-                approval_checked_calls.append(call)
+            if decision.hard_deny:
+                rejected_messages.append(ToolMessage(
+                    content=json.dumps({"ok": False, "error": {
+                        "code": "policy_hard_deny",
+                        "message": "策略拒绝：" + "; ".join(decision.reasons[:4]),
+                        "retryable": False,
+                    }}, ensure_ascii=False),
+                    tool_call_id=call_id, name=str(call.get("name") or ""),
+                    status="error",
+                ))
                 continue
             action = await asyncio.to_thread(
                 permission_broker.find,
                 thread_id=thread_id, tool_call_id=call_id
             )
+            if action is not None and not action.matches_call(
+                str(original_call.get("name") or ""), original_call.get("args")
+            ):
+                rejected_messages.append(ToolMessage(
+                    content=json.dumps({"ok": False, "error": {
+                        "code": "approval_mismatch",
+                        "message": "工具或参数与人工批准的内容不一致，未执行。",
+                        "retryable": False,
+                    }}, ensure_ascii=False),
+                    tool_call_id=call_id, name=str(call.get("name") or ""),
+                    status="error",
+                ))
+                continue
+            if not decision.needs_approval:
+                approval_checked_calls.append(call)
+                continue
             if action is None:
                 content = json.dumps(
                     {"ok": False, "error": {"code": "approval_missing", "message": "操作没有有效的单次审批记录。", "retryable": False}},
@@ -1960,6 +2025,7 @@ def create_agent_app(
             None,
         )  # 获取最近的用户消息,避免工具调用或AI消息干扰
         user_text = str(last_human.content) if last_human else ""
+        thread_id = _thread_id(config)
         # 路由重算可能触发 LLM 重排/远程 embedding（阻塞网络调用），放线程池
         decision, turn_contract, scoped_tools, scope_label = await asyncio.to_thread(
             _turn_contract, thread_id, user_text
@@ -2784,8 +2850,18 @@ def create_agent_app(
             note = (
                 f"工具路由拒绝：本轮已根据用户请求选择相关能力{scope_label or '集合'},不允许调用未入选的工具。请改用相关工具或直接回答用户。"
             )
+        else:
+            for call in tool_calls:
+                preflight_error = _tool_preflight(
+                    call, thread_id=thread_id,
+                    user_text=str(last_human.content) if last_human else "",
+                )
+                if preflight_error:
+                    note = preflight_error
+                    break
         if decision.reasons:
-            note = note + " reasons: " + "; ".join(decision.reasons[:4])
+            if not note.startswith("{"):
+                note = note + " reasons: " + "; ".join(decision.reasons[:4])
         for call in tool_calls:
             if call.get("name") == "propose_memory_change":
                 reason = _validate_memory_change(
@@ -2877,6 +2953,14 @@ def create_agent_app(
             None,
         )
         user_text = str(last_human.content) if last_human else ""
+        thread_id = _thread_id(config)
+        if any(
+            _tool_preflight(call, thread_id=thread_id, user_text=user_text)
+            for call in tool_calls
+        ):
+            target = "policy_block"
+            _record_transition(state, config, "agent", target)
+            return target
         # 判断是否有 propose_memory_change 工具调用，或有效的 memory_change 提案，或是否需要审批
         if any(
             call.get("name") == "propose_memory_change"
@@ -2898,17 +2982,6 @@ def create_agent_app(
 
         if any(call.get("name") == "propose_memory_change" for call in tool_calls):
             target = "approval"
-            _record_transition(state, config, "agent", target)
-            return target
-        
-        thread_id = _thread_id(config)
-        scoped_tools, scope_label = _turn_contract_cached_tools(
-            thread_id,
-            str(last_human.content) if last_human else "",
-        )
-        allowed_names = {str(tool.name) for tool in scoped_tools}
-        if any(tc.get("name") not in allowed_names for tc in tool_calls):
-            target = "policy_block"
             _record_transition(state, config, "agent", target)
             return target
         
